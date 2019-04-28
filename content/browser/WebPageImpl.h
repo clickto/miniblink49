@@ -1,6 +1,9 @@
 ﻿#ifndef WebPageImpl_h
 #define WebPageImpl_h
 
+#include "content/browser/WebPageState.h"
+#include "content/ui/PopupMenuWinClient.h"
+
 #include "base/rand_util.h"
 
 #include "third_party/WebKit/public/web/WebViewClient.h"
@@ -11,8 +14,9 @@
 #include "cc/trees/LayerTreeHost.h"
 #include "cc/trees/LayerTreeHostClient.h"
 #include "skia/ext/platform_canvas.h"
+#include "net/PageNetExtraData.h"
 
-#include "content/ui/PopupMenuWinClient.h"
+typedef struct HWND__ *HWND;
 
 namespace cc {
 class LayerTreeHost;
@@ -33,6 +37,14 @@ class WebViewImpl;
 class CefBrowserHostImpl;
 #endif
 
+namespace net {
+class PageNetExtraData;
+}
+
+namespace wke {
+class CWebView;
+}
+
 namespace content {
 
 class WebFrameClientImpl;
@@ -51,7 +63,7 @@ class WebPageImpl
     , public cc::LayerTreeHostClent
     , public PopupMenuWinClient {
 public:
-    WebPageImpl();
+    WebPageImpl(COLORREF bdColor);
     ~WebPageImpl();
 
     class DestroyNotif {
@@ -89,12 +101,17 @@ public:
     virtual void initializeLayerTreeView() override;
     virtual blink::WebWidget* createPopupMenu(blink::WebPopupType) override;
     virtual blink::WebStorageNamespace* createSessionStorageNamespace() override;
+#ifndef MINIBLINK_NO_PAGE_LOCALSTORAGE
+    virtual blink::WebStorageNamespace* createLocalStorageNamespace() override;
+#endif
     virtual blink::WebString acceptLanguages() override;
     void setScreenInfo(const blink::WebScreenInfo& info);
     virtual blink::WebScreenInfo screenInfo() override;
     virtual void setMouseOverURL(const blink::WebURL&) override;
     virtual void setToolTipText(const blink::WebString&, blink::WebTextDirection hint) override;
     virtual void draggableRegionsChanged() override;
+    virtual void onMouseDown(const blink::WebNode& mouseDownNode) override;
+    virtual void printPage(blink::WebLocalFrame* frame) override;
 
     // Editing --------------------------------------------------------
     virtual bool handleCurrentKeyboardEvent() override;
@@ -121,12 +138,17 @@ public:
     // PopupMenuWinClient --------------------------------------------------------
     virtual void onPopupMenuCreate(HWND hWnd) override;
     virtual void onPopupMenuHide() override;
+
+    // Dialogs -------------------------------------------------------------
+    virtual void showValidationMessage(const blink::WebRect& anchorInViewport, const blink::WebString& mainText, blink::WebTextDirection mainTextDir, const blink::WebString& supplementalText, blink::WebTextDirection supplementalTextDir) override;
+    virtual void hideValidationMessage() override;
+    virtual void moveValidationMessage(const blink::WebRect& anchorInViewport) override;
     
     void testPaint();
 
     void beginMainFrame();
     
-    void repaintRequested(const blink::IntRect& windowRect);
+    void repaintRequested(const blink::IntRect& windowRect, bool forceRepaintIfEmptyRect);
 
     void freeV8TempObejctOnOneFrameBefore();
 
@@ -145,6 +167,7 @@ public:
     bool fireKeyPressEvent(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     int getCursorInfoType() const;
+    void setCursorInfoType(int type);
 
     HDC viewDC();
     void paintToBit(void* bits, int pitch);
@@ -167,6 +190,7 @@ public:
     virtual void paintToMemoryCanvasInUiThread(SkCanvas* canvas, const blink::IntRect& paintRect) override;
     
     cc::LayerTreeHost* layerTreeHost() { return m_layerTreeHost; }
+    void setDrawMinInterval(double drawMinInterval);
 
     void loadHistoryItem(int64 frameId, const blink::WebHistoryItem& item, blink::WebHistoryLoadType type, blink::WebURLRequest::CachePolicy policy);
     void loadURL(int64 frameId, const wchar_t* url, const blink::Referrer& referrer, const wchar_t* extraHeaders);
@@ -182,6 +206,7 @@ public:
     virtual void navigateBackForwardSoon(int offset) override;
     virtual int historyBackListCount() override;
     virtual int historyForwardListCount() override;
+    void navigateToIndex(int index);
 
     static WebPageImpl* getSelfForCurrentContext();
 
@@ -191,6 +216,7 @@ public:
     void setBrowser(CefBrowserHostImpl* browser);
 #endif
     blink::WebFrame* getWebFrameFromFrameId(int64_t frameId);
+    static int64_t getFrameIdByBlinkFrame(const blink::WebFrame* frame);
     static int64_t getFirstFrameId();
 
     blink::WebView* createWkeView(blink::WebLocalFrame* creator,
@@ -226,11 +252,24 @@ public:
     bool m_isDragging;
     bool m_isFirstEnterDrag;
 
+    void setBackgroundColor(COLORREF c);
+
+    void setHwndRenderOffset(const blink::IntPoint& offset);
+    blink::IntPoint getHwndRenderOffset() const;
+
+    void setCookieJarFullPath(const char* path);
+    void setLocalStorageFullPath(const char* path);
+
+    net::WebCookieJarImpl* getCookieJar();
+
+    RefPtr<net::PageNetExtraData> m_pageNetExtraData;
+
     static int64_t m_firstFrameId;
 
     blink::WebThread::TaskObserver* m_createDevToolsAgentTaskObserver;
 
     ToolTip* m_toolTip;
+    ToolTip* m_validationMessageTip;
 
     blink::IntRect m_winodwRect;
 
@@ -251,15 +290,14 @@ public:
 #if (defined ENABLE_CEF) && (ENABLE_CEF == 1)
     CefBrowserHostImpl* m_browser;
 #endif
+
+#if ENABLE_WKE == 1
+    wke::CWebView* wkeWebView() const;
+#endif
     cc::LayerTreeHost* m_layerTreeHost;
     bool m_painting;
         
-    enum WebPageState {
-        pageUninited,
-        pageInited,
-        pageDestroying,
-        pageDestroyed
-    } m_state;
+    WebPageState m_state;
 
     bool m_LMouseDown;
     bool m_RMouseDown;

@@ -55,6 +55,10 @@
 typedef HWND PlatformWidget;
 typedef PlatformWidget PlatformPluginWidget;
 
+namespace wke {
+class CWebView;
+}
+
 namespace blink {
 class WebPluginContainer;
 class GraphicsContext;
@@ -158,11 +162,9 @@ public:
     virtual bool isPrintScalingDisabled() { return false; }
     virtual bool getPrintPresetOptionsFromDocument(blink::WebPrintPresetOptions*) { return false; }
 
-    virtual int printBegin(const blink::WebPrintParams& printParams) { return 0; }
-
-    virtual void printPage(int pageNumber, blink::WebCanvas* canvas) { }
-
-    virtual void printEnd() { }
+    virtual int printBegin(const blink::WebPrintParams& printParams) override;
+    virtual void printPage(int pageNumber, blink::WebCanvas* canvas) override;
+    virtual void printEnd() override;
 
     virtual bool hasSelection() const { return false; }
     virtual blink::WebString selectionAsText() const { return blink::WebString(); }
@@ -182,10 +184,6 @@ public:
     virtual void selectFindResult(bool forward) { }
     virtual void stopFind() { }
 
-    enum RotationType {
-        RotationType90Clockwise,
-        RotationType90Counterclockwise
-    };
     virtual bool canRotateView() { return false; }
     virtual void rotateView(RotationType type) { }
 
@@ -278,14 +276,6 @@ public:
         return m_widget;
     }
 
-//     PlatformWidget platformWidget() const { return m_widget; }
-//     void setPlatformWidget(PlatformWidget widget)
-//     {
-//         if (widget != m_widget) {
-//             m_widget = widget;
-//         }
-//     }
-
     void setParentPlatformPluginWidget(PlatformWidget widget)
     {
         if (widget != m_parentWidget)
@@ -297,8 +287,8 @@ public:
         return m_parentWidget;
     }
     
-
-    void setWebViewClient(blink::WebViewClient* client) { m_webviewClient = client; }
+    void setWkeWebView(wke::CWebView* wkeWebview) { m_wkeWebview = wkeWebview; }
+    wke::CWebView* getWkeWebView() { return m_wkeWebview; }
 
     void setHwndRenderOffset(const blink::IntPoint& offset)
     {
@@ -306,6 +296,8 @@ public:
     }
 
 private:
+    void findVirtualPluginByMime();
+
     void setParameters(const blink::WebVector<blink::WebString>& paramNames, const blink::WebVector<blink::WebString>& paramValues);
     bool startOrAddToUnstartedList();
     void init();
@@ -433,7 +425,7 @@ private:
     static WebPluginImpl* s_currentPluginView;
 
     SkCanvas* m_memoryCanvas;
-    blink::WebViewClient* m_webviewClient;
+    wke::CWebView* m_wkeWebview;
 };
 
 } // namespace content

@@ -61,6 +61,7 @@ WebPage::WebPage(void* foreignPtr)
     m_wkeHandler = new wke::CWebViewHandler();
     memset(m_wkeHandler, 0, sizeof(wke::CWebViewHandler));
 #endif
+    m_isContextMenuEnable = true;
 }
 
 WebPage::~WebPage()
@@ -77,9 +78,9 @@ WebPage::~WebPage()
     m_webPageSet->remove(this);
 }
 
-bool WebPage::init(HWND hWnd)
+bool WebPage::init(HWND hWnd, COLORREF color)
 {
-    m_pageImpl = new WebPageImpl();
+    m_pageImpl = new WebPageImpl(color);
     m_pageImpl->init(this, hWnd);
     
     return true;
@@ -108,6 +109,12 @@ void WebPage::setIsDraggableRegionNcHitTest()
     //m_pageImpl->m_isDraggableRegionNcHitTest = true;
 }
 
+void WebPage::setDrawMinInterval(double drawMinInterval)
+{
+    if (m_pageImpl)
+        m_pageImpl->setDrawMinInterval(drawMinInterval);
+}
+
 void WebPage::setNeedsCommit()
 {
     if (m_pageImpl)
@@ -126,6 +133,13 @@ bool WebPage::isDrawDirty() const
     if (m_pageImpl)
         return m_pageImpl->isDrawDirty();
     return false;
+}
+
+WebPageState WebPage::getState() const
+{
+    if (m_pageImpl)
+        return m_pageImpl->m_state;
+    return pageUninited;
 }
 
 void WebPage::close()
@@ -163,6 +177,16 @@ void WebPage::enablePaint()
         m_pageImpl->enablePaint();
 }
 
+void WebPage::setContextMenuEnabled(bool b)
+{
+    m_isContextMenuEnable = b;
+}
+
+bool WebPage::getContextMenuEnabled() const
+{
+    return m_isContextMenuEnable;
+}
+
 void WebPage::willEnterDebugLoop()
 {
     if (m_pageImpl)
@@ -194,10 +218,10 @@ void WebPage::fireResizeEvent(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPa
         m_pageImpl->fireResizeEvent(hWnd, message, wParam, lParam);
 }
 
-void WebPage::repaintRequested(const IntRect& windowRect)
+void WebPage::repaintRequested(const IntRect& windowRect, bool forceRepaintIfEmptyRect)
 {
     if (m_pageImpl)
-        m_pageImpl->repaintRequested(windowRect); 
+        m_pageImpl->repaintRequested(windowRect, forceRepaintIfEmptyRect);
 }
 
 void WebPage::firePaintEvent(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -230,7 +254,7 @@ void WebPage::fireKillFocusEvent(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 LRESULT WebPage::fireMouseEvent(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam, BOOL* bHandle)
 {
     if (bHandle)
-        bHandle = FALSE;
+        *bHandle = FALSE;
     if (m_pageImpl)
         return m_pageImpl->fireMouseEvent(hWnd, message, wParam, lParam, bHandle);
     return 0;
@@ -278,6 +302,12 @@ int WebPage::getCursorInfoType() const
     return -1;
 }
 
+void WebPage::setCursorInfoType(int type)
+{
+    if (m_pageImpl)
+        m_pageImpl->setCursorInfoType(type);
+}
+
 IntSize WebPage::viewportSize() const
 { 
     if (m_pageImpl)
@@ -301,13 +331,13 @@ void WebPage::setHWND(HWND hwnd)
 void WebPage::setHwndRenderOffset(const blink::IntPoint& offset)
 {
     if (m_pageImpl)
-        m_pageImpl->m_hwndRenderOffset = offset;
+        m_pageImpl->setHwndRenderOffset(offset);
 }
 
 blink::IntPoint WebPage::getHwndRenderOffset() const
 {
     if (m_pageImpl)
-        return m_pageImpl->m_hwndRenderOffset;
+        return m_pageImpl->getHwndRenderOffset();
     return blink::IntPoint();
 }
 
@@ -388,7 +418,7 @@ void WebPage::loadHTMLString(int64 frameId, const WebData& html, const WebURL& b
 
 void WebPage::setBackgroundColor(COLORREF c) {
     if (m_pageImpl)
-        m_pageImpl->m_bdColor = c;
+        m_pageImpl->setBackgroundColor(c);
 }
 
 #if (defined ENABLE_CEF) && (ENABLE_CEF == 1)
@@ -434,6 +464,18 @@ void WebPage::goForward()
         m_pageImpl->navigateBackForwardSoon(1);
 }
 
+void WebPage::goToOffset(int offset)
+{
+    if (m_pageImpl)
+        m_pageImpl->navigateBackForwardSoon(offset);
+}
+
+void WebPage::goToIndex(int index)
+{
+    if (m_pageImpl)
+        m_pageImpl->navigateToIndex(index);
+}
+
 void WebPage::didCommitProvisionalLoad(blink::WebLocalFrame* frame, const blink::WebHistoryItem& history, 
     blink::WebHistoryCommitType type, bool isSameDocument)
 {
@@ -460,6 +502,32 @@ blink::WebScreenInfo WebPage::screenInfo()
     return blink::WebScreenInfo();
 }
 
+net::WebCookieJarImpl* WebPage::getCookieJar()
+{
+    if (m_pageImpl)
+        return m_pageImpl->getCookieJar();
+    return nullptr;    
+}
+
+PassRefPtr<net::PageNetExtraData> WebPage::getPageNetExtraData()
+{
+    if (m_pageImpl)
+        return m_pageImpl->m_pageNetExtraData;
+    return nullptr;
+}
+
+void WebPage::setCookieJarFullPath(const char* path)
+{
+    if (m_pageImpl)
+        return m_pageImpl->setCookieJarFullPath(path);
+}
+
+void WebPage::setLocalStorageFullPath(const char* path)
+{
+    if (m_pageImpl)
+        return m_pageImpl->setLocalStorageFullPath(path);
+}
+
 WebPage* WebPage::getSelfForCurrentContext()
 {
     WebPageImpl* impl = WebPageImpl::getSelfForCurrentContext();
@@ -474,6 +542,11 @@ WebViewImpl* WebPage::webViewImpl()
     if (m_pageImpl)
         return m_pageImpl->m_webViewImpl;
     return nullptr;
+}
+
+WebPageImpl* WebPage::webPageImpl()
+{
+    return m_pageImpl;
 }
 
 WebFrame* WebPage::mainFrame()
@@ -501,16 +574,11 @@ WebFrame* WebPage::getWebFrameFromFrameId(int64_t frameId)
     return m_pageImpl->getWebFrameFromFrameId(frameId);
 }
 
-
 int64_t WebPage::getFrameIdByBlinkFrame(const blink::WebFrame* frame)
 {
-    if (!frame)
+    if (!m_pageImpl)
         return content::WebPage::kInvalidFrameId;
-
-    blink::Frame* blinkFrame = blink::toCoreFrame(frame);
-    if (!blinkFrame)
-        return content::WebPage::kInvalidFrameId;
-    return blinkFrame->frameID();
+    return m_pageImpl->getFrameIdByBlinkFrame(frame);
 }
 
 int64_t WebPage::getFirstFrameId()

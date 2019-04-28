@@ -33,12 +33,6 @@
 #define SocketStreamHandle_h
 
 #include "net/websocket/SocketStreamHandleBase.h"
-
-//#include <winsock2.h>
-
-#define CURL_STATICLIB
-#include "third_party/libcurl/include/curl/curl.h"
-
 #include "third_party/WebKit/Source/wtf/Deque.h"
 #include "third_party/WebKit/Source/wtf/Locker.h"
 #include "third_party/WebKit/Source/wtf/RefCounted.h"
@@ -46,6 +40,7 @@
 #include "third_party/WebKit/Source/wtf/PassRefPtr.h"
 #include "third_party/WebKit/Source/wtf/ThreadSafeRefCounted.h"
 #include "third_party/WebKit/Source/wtf/ThreadingPrimitives.h"
+#include "third_party/libcurl/include/curl/curl.h"
 
 namespace blink {
 class AuthenticationChallenge;
@@ -123,6 +118,7 @@ private:
     WTF::Mutex m_mutexReceive;
     Deque<OwnPtr<SocketData>> m_sendData;
     Deque<OwnPtr<SocketData>> m_receiveData;
+    int m_readDataTaskCount;
 };
 
 } // namespace net

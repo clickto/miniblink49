@@ -1,8 +1,8 @@
 
 #include "content/browser/WebFrameClientImpl.h"
 #include "content/browser/WebPage.h"
+#include "content/browser/WebPageImpl.h"
 #include "content/ui/ContextMeun.h"
-#include "content/web_impl_win/WebCookieJarCurlImpl.h"
 #include "content/web_impl_win/WebMediaPlayerImpl.h"
 #include "content/web_impl_win/npapi/WebPluginImpl.h"
 #if (defined ENABLE_CEF) && (ENABLE_CEF == 1)
@@ -35,6 +35,13 @@
 #include "third_party/WebKit/Source/core/page/Page.h"
 #include "third_party/WebKit/Source/wtf/text/WTFStringUtil.h"
 #include "net/RequestExtraData.h"
+#include "net/cookies/WebCookieJarCurlImpl.h"
+
+#if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
+namespace wke {
+class CWebView;
+}
+#endif
 
 namespace content {
 
@@ -82,13 +89,15 @@ void WebFrameClientImpl::didAddMessageToConsole(const WebConsoleMessage& message
         outstr.append("\n");
     }
 
-    Vector<UChar> utf16 = WTF::ensureUTF16UChar(outstr, true);
-    OutputDebugStringW(utf16.data());
+    if (wke::g_consoleOutputEnable) {
+        Vector<UChar> utf16 = WTF::ensureUTF16UChar(outstr, true);
+        OutputDebugStringW(utf16.data());
+    }
 
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.consoleCallback) {
+    if (handler.consoleCallback && m_webPage->getState() == pageInited) {
         wke::CString text(message.text);
         wke::CString sourceNameStr(sourceName);
         wke::CString stackTraceStr(stackTrace);
@@ -172,10 +181,9 @@ blink::WebPlugin* WebFrameClientImpl::createPlugin(WebLocalFrame* frame, const W
     PassRefPtr<WebPluginImpl> plugin = adoptRef(new WebPluginImpl(frame, newParam));
     plugin->setParentPlatformPluginWidget(m_webPage->getHWND());
     plugin->setHwndRenderOffset(m_webPage->getHwndRenderOffset());
-    plugin->setWebViewClient(m_webPage->webViewImpl()->client());
+    plugin->setWkeWebView(m_webPage->wkeWebView());
+
     return plugin.leakRef();
-
-
 }
 
 blink::WebMediaPlayer* WebFrameClientImpl::createMediaPlayer(WebLocalFrame* frame, const WebURL& url , WebMediaPlayerClient* client, WebContentDecryptionModule*)
@@ -201,9 +209,18 @@ WebExternalPopupMenu* WebFrameClientImpl::createExternalPopupMenu(const WebPopup
     return 0;
 }
 
-WebCookieJar* WebFrameClientImpl::cookieJar(WebLocalFrame*)
+WebCookieJar* WebFrameClientImpl::cookieJar(WebLocalFrame* frame)
 {
-    return WebCookieJarImpl::inst();
+    PassRefPtr<net::PageNetExtraData> extra = m_webPage->getPageNetExtraData();
+    if (extra && extra->getCookieJar())
+        return extra->getCookieJar();
+
+    net::WebURLLoaderManager* manager = net::WebURLLoaderManager::sharedInstance();
+    if (!manager)
+        return nullptr;
+
+    net::WebCookieJarImpl* result = manager->getShareCookieJar();
+    return result;
 }
 
 void WebFrameClientImpl::resetLoadState()
@@ -249,7 +266,7 @@ void WebFrameClientImpl::didStartLoading(bool toDifferentDocument)
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.otherLoadCallback) {
+    if (handler.otherLoadCallback && m_webPage->getState() == pageInited) {
         wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(m_webPage->wkeWebView());
         tempInfo->size = sizeof(wkeTempCallbackInfo);
         tempInfo->frame = nullptr;
@@ -301,10 +318,12 @@ void WebFrameClientImpl::didFailProvisionalLoad(WebLocalFrame* frame, const WebU
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.loadingFinishCallback) {
+    if (handler.loadingFinishCallback && m_webPage->getState() == pageInited) {
         wkeLoadingResult result = WKE_LOADING_FAILED;
-        wke::CString failedReason(error.localizedDescription);
-        wke::CString url(error.unreachableURL.string());
+        String failedReasonStr = String::format("error reason: %d, ", error.reason);
+        failedReasonStr.append(error.localizedDescription);
+        wke::CString failedReason(failedReasonStr);
+        wke::CString url(error.domain); // error is set in WebURLLoaderManager::downloadOnIoThread
 
         if (error.isCancellation)
             result = WKE_LOADING_CANCELED;
@@ -322,7 +341,8 @@ static wkeWebFrameHandle frameIdToWkeFrame(WebPage* webPage, WebLocalFrame* fram
 
 void WebFrameClientImpl::didCommitProvisionalLoad(WebLocalFrame* frame, const WebHistoryItem& history, WebHistoryCommitType type)
 {
-    m_webPage->didCommitProvisionalLoad(frame, history, type, false);
+    if (!frame->parent())
+        m_webPage->didCommitProvisionalLoad(frame, history, type, false);
 
 #if (defined ENABLE_CEF) && (ENABLE_CEF == 1)
     CefBrowserHostImpl* browser = m_webPage->browser();
@@ -339,13 +359,13 @@ void WebFrameClientImpl::didCommitProvisionalLoad(WebLocalFrame* frame, const We
     if (m_webPage->wkeWebView() && !frame->parent())
         m_webPage->wkeWebView()->onUrlChanged(&string);
 
-    if (handler.urlChangedCallback) 
+    if (handler.urlChangedCallback && m_webPage->getState() == pageInited)
         handler.urlChangedCallback(m_webPage->wkeWebView(), handler.urlChangedCallbackParam, &string);
 
-    if (handler.urlChangedCallback2)
+    if (handler.urlChangedCallback2 && m_webPage->getState() == pageInited)
         handler.urlChangedCallback2(m_webPage->wkeWebView(), handler.urlChangedCallback2Param, frameIdToWkeFrame(m_webPage, frame), &string);
 
-    if (handler.otherLoadCallback) {
+    if (handler.otherLoadCallback && m_webPage->getState() == pageInited) {
         wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(m_webPage->wkeWebView());
         tempInfo->size = sizeof(wkeTempCallbackInfo);
         tempInfo->frame = frameIdToWkeFrame(m_webPage, frame);
@@ -370,7 +390,7 @@ void WebFrameClientImpl::didReceiveTitle(WebLocalFrame* frame, const WebString& 
         m_title = title;
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
         wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-        if (handler.titleChangedCallback) {
+        if (handler.titleChangedCallback && m_webPage->getState() == pageInited) {
             wke::CString string(title);
             handler.titleChangedCallback(m_webPage->wkeWebView(), handler.titleChangedCallbackParam, &string);
         }
@@ -395,9 +415,9 @@ void WebFrameClientImpl::didFinishDocumentLoad(WebLocalFrame* frame)
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.documentReadyCallback)
+    if (handler.documentReadyCallback && m_webPage->getState() == pageInited)
         handler.documentReadyCallback(m_webPage->wkeWebView(), handler.documentReadyCallbackParam);
-    if (handler.documentReady2Callback)
+    if (handler.documentReady2Callback && m_webPage->getState() == pageInited)
         handler.documentReady2Callback(m_webPage->wkeWebView(), handler.documentReady2CallbackParam, frameIdToWkeFrame(m_webPage, frame));
 #endif
 
@@ -419,9 +439,11 @@ void WebFrameClientImpl::didFailLoad(WebLocalFrame* frame, const WebURLError& er
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.loadingFinishCallback) {
+    if (handler.loadingFinishCallback && m_webPage->getState() == pageInited) {
         wkeLoadingResult result = WKE_LOADING_FAILED;
-        wke::CString failedReason(error.localizedDescription);
+        String failedReasonStr = String::format("error reason: %d, ", error.reason);
+        failedReasonStr.append(error.localizedDescription);
+        wke::CString failedReason(failedReasonStr);
         wke::CString url(error.unreachableURL.string());
 
         if (error.isCancellation)
@@ -446,9 +468,8 @@ void WebFrameClientImpl::didFinishLoad(WebLocalFrame* frame)
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
     wke::CWebViewHandler& handler = m_webPage->wkeHandler();
-    if (handler.loadingFinishCallback) {
+    if (handler.loadingFinishCallback && m_webPage->getState() == pageInited) {
         wkeLoadingResult result = WKE_LOADING_SUCCEEDED;
-        //blink::WebFrame* webFrame = m_webPage->mainFrame();
         wke::CString url(frame->document().url().string());
 
         wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(m_webPage->wkeWebView());
@@ -462,11 +483,7 @@ void WebFrameClientImpl::didFinishLoad(WebLocalFrame* frame)
 }
 
 void WebFrameClientImpl::didNavigateWithinPage(WebLocalFrame* frame, const WebHistoryItem& history, WebHistoryCommitType type)
-{
-    //     cef_load_handler_t* loadHandler = m_cefBrowserHostImpl->m_browserImpl->m_loadHandler;
-    //     m_cefBrowserHostImpl->m_browserImpl->ref();
-    //     loadHandler->on_loading_state_change(loadHandler, &m_cefBrowserHostImpl->m_browserImpl->m_baseClass, false, false, false);
-    
+{    
     m_webPage->didCommitProvisionalLoad(frame, history, type, true);
 
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
@@ -478,13 +495,13 @@ void WebFrameClientImpl::didNavigateWithinPage(WebLocalFrame* frame, const WebHi
     if (m_webPage->wkeWebView() && !frame->parent())
         m_webPage->wkeWebView()->onUrlChanged(&string);
 
-    if (handler.urlChangedCallback)
+    if (handler.urlChangedCallback && m_webPage->getState() == pageInited)
         handler.urlChangedCallback(m_webPage->wkeWebView(), handler.urlChangedCallbackParam, &string);
 
-    if (handler.urlChangedCallback2)
+    if (handler.urlChangedCallback2 && m_webPage->getState() == pageInited)
         handler.urlChangedCallback2(m_webPage->wkeWebView(), handler.urlChangedCallback2Param, frameIdToWkeFrame(m_webPage, frame), &string);
 
-    if (handler.otherLoadCallback) {
+    if (handler.otherLoadCallback && m_webPage->getState() == pageInited) {
         wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(m_webPage->wkeWebView());
         tempInfo->size = sizeof(wkeTempCallbackInfo);
         tempInfo->frame = frameIdToWkeFrame(m_webPage, frame);
@@ -504,7 +521,10 @@ void WebFrameClientImpl::didChangeManifest(WebLocalFrame*) { }
 void WebFrameClientImpl::didChangeDefaultPresentation(WebLocalFrame*) { }
 void WebFrameClientImpl::didChangeThemeColor() { }
 
-void WebFrameClientImpl::dispatchLoad() { }
+void WebFrameClientImpl::dispatchLoad()
+{
+    OutputDebugStringA("WebFrameClientImpl::dispatchLoad\n");
+}
 
 WebNavigationPolicy WebFrameClientImpl::decidePolicyForNavigation(const NavigationPolicyInfo& info)
 {
@@ -561,7 +581,7 @@ WebNavigationPolicy WebFrameClientImpl::decidePolicyForNavigation(const Navigati
 
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().navigationCallback) {
+    if (m_webPage->wkeHandler().navigationCallback && m_webPage->getState() == pageInited) {
         wkeNavigationType navigationType = WKE_NAVIGATION_TYPE_OTHER;
         switch (info.navigationType) {
         case blink::WebNavigationTypeLinkClicked:
@@ -588,9 +608,15 @@ WebNavigationPolicy WebFrameClientImpl::decidePolicyForNavigation(const Navigati
         WebString url16 = info.urlRequest.url().string();
         wke::CString url(url16);
 
-        bool ok = m_webPage->wkeHandler().navigationCallback(m_webPage->wkeWebView(), m_webPage->wkeHandler().navigationCallbackParam, navigationType, &url);
+        wkeWebView webView = m_webPage->wkeWebView();
+        wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(webView);
+        tempInfo->size = sizeof(wkeTempCallbackInfo);
+        tempInfo->frame = frameIdToWkeFrame(m_webPage, info.frame);
+
+        bool ok = m_webPage->wkeHandler().navigationCallback(webView, m_webPage->wkeHandler().navigationCallbackParam, navigationType, &url);
         if (!ok)
             return WebNavigationPolicyIgnore;
+		info.urlRequest.setURL(WebURL(KURL(blink::ParsedURLString, url.string())));
     }
 #endif
     return info.defaultPolicy;
@@ -612,7 +638,7 @@ void WebFrameClientImpl::willSendRequest(WebLocalFrame* webFrame, unsigned ident
         return;
 
     net::RequestExtraData* requestExtraData = new net::RequestExtraData();
-    requestExtraData->frame = webFrame; // 两种模式都需要此对象
+
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     requestExtraData->page = m_webPage;
 #endif
@@ -621,9 +647,11 @@ void WebFrameClientImpl::willSendRequest(WebLocalFrame* webFrame, unsigned ident
     requestExtraData->browser = m_webPage->browser();
 #endif
 
+    requestExtraData->setFrame(webFrame); // 两种模式都需要此对象
+
     request.setExtraData(requestExtraData);
 
-    request.addHTTPHeaderField("Accept-Language", "zh-cn,zh;q=0.5");
+    request.addHTTPHeaderField("Accept-Language", m_webPage->webPageImpl()->acceptLanguages());
 
 //     WebViewImpl* viewImpl = m_webPage->webViewImpl();
 //     if (!viewImpl)
@@ -697,7 +725,7 @@ void WebFrameClientImpl::runModalAlertDialog(const WebString& message)
     bool needCall = true;
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().alertBoxCallback) {
+    if (m_webPage->wkeHandler().alertBoxCallback && m_webPage->getState() == pageInited) {
         needCall = false;
         wke::CString wkeMsg(message);
         m_webPage->wkeHandler().alertBoxCallback(m_webPage->wkeWebView(), m_webPage->wkeHandler().alertBoxCallbackParam, &wkeMsg);
@@ -716,7 +744,7 @@ bool WebFrameClientImpl::runModalConfirmDialog(const WebString& message)
     bool needCall = true;
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().alertBoxCallback) {
+    if (m_webPage->wkeHandler().confirmBoxCallback && m_webPage->getState() == pageInited) {
         needCall = false;
         wke::CString wkeMsg(message);
         return m_webPage->wkeHandler().confirmBoxCallback(m_webPage->wkeWebView(), m_webPage->wkeHandler().confirmBoxCallbackParam, &wkeMsg);
@@ -737,7 +765,7 @@ bool WebFrameClientImpl::runModalPromptDialog(const WebString& message, const We
     bool result = false;
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().promptBoxCallback) {
+    if (m_webPage->wkeHandler().promptBoxCallback && m_webPage->getState() == pageInited) {
         needCall = false;
         wke::CString wkeMsg(message);
         wke::CString defaultResult(defaultValue);
@@ -768,7 +796,15 @@ void WebFrameClientImpl::showContextMenu(const blink::WebContextMenuData& data)
 {
     if (!m_menu)
         m_menu = new ContextMenu(m_webPage);
-    m_menu->show(data);
+
+    blink::WebDocument doc = data.node.document();
+    blink::WebLocalFrame* frmae = doc.frame();
+    int64_t frameId = 0;
+    if (frmae)
+        frameId = WebPageImpl::getFrameIdByBlinkFrame(frmae);
+
+    if (m_webPage->getContextMenuEnabled())
+        m_menu->show(data, frameId);
 }
 
 void WebFrameClientImpl::clearContextMenu()
@@ -778,6 +814,8 @@ void WebFrameClientImpl::clearContextMenu()
 
 void WebFrameClientImpl::didCreateScriptContext(WebLocalFrame* frame, v8::Local<v8::Context> context, int extensionGroup, int worldId)
 {
+    v8::V8::SetCaptureStackTraceForUncaughtExceptions(true, 50, v8::StackTrace::kDetailed);
+
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     if (frame->top() == frame)
         wke::onCreateGlobalObjectInMainFrame(this, frame, context, extensionGroup, worldId);
@@ -785,7 +823,7 @@ void WebFrameClientImpl::didCreateScriptContext(WebLocalFrame* frame, v8::Local<
         wke::onCreateGlobalObjectInSubFrame(this, frame, context, extensionGroup, worldId);
 
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().didCreateScriptContextCallback)
+    if (m_webPage->wkeHandler().didCreateScriptContextCallback && m_webPage->getState() == pageInited)
         m_webPage->wkeHandler().didCreateScriptContextCallback(m_webPage->wkeWebView(), m_webPage->wkeHandler().didCreateScriptContextCallbackParam,
             frameIdToWkeFrame(m_webPage, frame), &context, extensionGroup, worldId);
 #endif
@@ -816,10 +854,11 @@ void WebFrameClientImpl::willReleaseScriptContext(WebLocalFrame* frame, v8::Loca
     }
 
     wke::AutoDisableFreeV8TempObejct autoDisableFreeV8TempObejct;
-    if (m_webPage->wkeHandler().willReleaseScriptContextCallback)
+    if (m_webPage->wkeHandler().willReleaseScriptContextCallback && m_webPage->getState() == pageInited)
         m_webPage->wkeHandler().willReleaseScriptContextCallback(m_webPage->wkeWebView(), m_webPage->wkeHandler().willReleaseScriptContextCallbackParam,
             frameIdToWkeFrame(m_webPage, frame), &context, worldId);
 #endif
+
 #if (defined ENABLE_CEF) && (ENABLE_CEF == 1)
     if (!CefContentClient::Get())
         return;

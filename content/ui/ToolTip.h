@@ -1,9 +1,12 @@
-#ifndef content_browser_ToolTip_h
+ï»¿#ifndef content_browser_ToolTip_h
 #define content_browser_ToolTip_h
 
+#include "wke/wkeGlobalVar.h"
 #include "third_party/WebKit/Source/platform/Timer.h"
 #include <windows.h>
 #include <xstring>
+
+typedef void (*TipPaintCallback) (HWND hWnd, HDC hdc, const wchar_t * text, size_t textLength);
 
 namespace content {
 
@@ -11,24 +14,29 @@ namespace content {
 
 class ToolTip {
 public:
-    ToolTip()
+    ToolTip(bool isToolsTip, double repeatInterval)
         : m_delayShowTimer(this, &ToolTip::delayShowTimerFired)
         , m_delayHideTimer(this, &ToolTip::delayHideTimerFired)
+        , m_isToolsTip(isToolsTip)
+        , m_delayShowCount(0)
+        , m_delayHideCount(0)
+        , m_isShow(false)
+        , m_hTipWnd(nullptr)
+        , m_hFont(nullptr)
+        , m_repeatInterval(repeatInterval)
     {
-        m_delayShowCount = 0;
-        m_delayHideCount = 0;
+        init();
     }
+
     void init()
     {
-        m_isShow = false;
-
         registerClass();
         m_hTipWnd = CreateWindowEx(WS_EX_TOOLWINDOW, kToolTipClassName, kToolTipClassName, WS_POPUP | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 225, 140, HWND_DESKTOP, NULL, nullptr, this);
         ::SetPropW(m_hTipWnd, kToolTipClassName, (HANDLE)this);
 
         m_hFont = CreateFont(18, 0, 0, 0, FW_THIN, FALSE, FALSE, FALSE,
             GB2312_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Î¢ÈíÑÅºÚ");
+            DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"å¾®è½¯é›…é»‘");
     }
 
     ~ToolTip()
@@ -57,20 +65,22 @@ public:
         return !!RegisterClassEx(&wcex);
     }
 
-    void show(const WCHAR* text)
+    void show(const WCHAR* text, POINT* pos)
     {
         if (!text) {
-            hide();
+            if (m_isToolsTip)
+                hide();
             return;
         }
         std::wstring textString = text;
         if (0 == textString.size()) {
-            hide();
+            if (m_isToolsTip)
+                hide();
             return;
         }
 
         bool isSameText = textString == m_text;
-        if (!isSameText) {
+        if (!isSameText || !m_isToolsTip) {
             m_text = textString;
 
             HDC hScreenDc = ::GetDC(m_hTipWnd);
@@ -79,7 +89,10 @@ public:
             ::SelectObject(hScreenDc, hOldFont);
             ::ReleaseDC(m_hTipWnd, hScreenDc);
 
-            ::GetCursorPos(&m_pos);
+            if (pos)
+                m_pos = *pos;
+            else
+                ::GetCursorPos(&m_pos);
 
             resetShowState();
         }
@@ -111,18 +124,25 @@ public:
 
     void onPaint(HWND hWnd, HDC hdc)
     {
+        if (wke::g_tipPaintCallback) {
+            TipPaintCallback fun = (TipPaintCallback)wke::g_tipPaintCallback;
+            fun(hWnd, hdc, m_text.c_str(), m_text.size());
+            return;
+        }
+
         RECT rc = { 0 };
         ::GetClientRect(hWnd, &rc);
+
+        HPEN hCurrentPen = ::CreatePen(PS_SOLID, 1, RGB(126, 126, 126));
+        HGDIOBJ hOldPen = SelectObject(hdc, hCurrentPen);
         ::Rectangle(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top);
-        HBRUSH hbrush = ::CreateSolidBrush(RGB(0x10, 0x10, 0x10));
-        ::SelectObject(hdc, hbrush);
-        ::Rectangle(hdc, 220, 40, 366, 266);
-        ::DeleteObject(hbrush);
+        ::SelectObject(hdc, hOldPen);
+        ::DeleteObject(hCurrentPen);
 
         ::SelectObject(hdc, m_hFont);
-        ::SetTextColor(hdc, RGB(0x0, 0x0, 0x0));
-        ::SetBkColor(hdc, RGB(255, 255, 225));
-        ::TextOut(hdc, 2, 2, m_text.c_str(), m_text.size());
+        ::SetTextColor(hdc, RGB(86, 86, 86));
+        ::SetBkColor(hdc, RGB(255, 255, 255));
+        ::TextOut(hdc, 4, 2, m_text.c_str(), m_text.size());
     }
 
     std::wstring getText() const { return m_text; }
@@ -133,12 +153,12 @@ private:
         if (m_delayShowTimer.isActive())
             m_delayShowTimer.stop();
         m_delayShowCount = 0;
-        m_delayShowTimer.start(0.02, 0.02, FROM_HERE);
+        m_delayShowTimer.start(0.5, m_repeatInterval, FROM_HERE);
     }
 
     bool isNearPos(const POINT& a, const POINT& b)
     {
-        return std::abs(a.x - b.x) + std::abs(a.y - b.y) < 15;
+        return std::abs((int)(a.x - b.x)) + std::abs((int)(a.y - b.y)) < 15;
     }
 
     void delayShowTimerFired(blink::Timer<ToolTip>*)
@@ -147,24 +167,22 @@ private:
 
         POINT point;
         ::GetCursorPos(&point);
-        if (!isNearPos(point, m_pos))
+        if (!isNearPos(point, m_pos) && m_isToolsTip)
             return hide();
 
-        if (15 < m_delayShowCount && !m_isShow) {
+        if (!m_isToolsTip)
+            point = m_pos;
+
+        if (/*(15 < m_delayShowCount || !m_isToolsTip) && */!m_isShow) {
             m_isShow = true;
 
-            ::SetWindowPos(m_hTipWnd, HWND_TOPMOST, point.x + 15, point.y + 15, m_size.cx + 5, m_size.cy + 5, SWP_NOACTIVATE);
+            ::SetWindowPos(m_hTipWnd, HWND_TOPMOST, point.x + 15, point.y + 15, m_size.cx + 7, m_size.cy + 5, SWP_NOACTIVATE);
             ::ShowWindow(m_hTipWnd, SW_SHOWNOACTIVATE);
             ::UpdateWindow(m_hTipWnd);
-//             if (m_delayShowTimer.isActive())
-//                 m_delayShowTimer.stop();
-//             m_delayShowCount = 0;
-
-//             if (m_delayHideTimer.isActive())
-//                 m_delayHideTimer.stop();
-//             m_delayHideCount = 0;
-//             m_delayHideTimer.start(0.02, 0.02, FROM_HERE);
         }
+
+        if (!m_isToolsTip && 3 < m_delayShowCount * m_repeatInterval)
+            hide();
     }
 
     void delayHideTimerFired(blink::Timer<ToolTip>*)
@@ -203,6 +221,8 @@ private:
     int m_delayHideCount;
     POINT m_pos;
     SIZE m_size;
+    bool m_isToolsTip;
+    double m_repeatInterval;
 };
 
 }

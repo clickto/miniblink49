@@ -327,8 +327,6 @@ void PluginStream::destroyStream()
 
             if (m_loader)
                 m_loader->setDefersLoading(false);
-
-            //LOG_NPERROR(npErr);
         }
 
         m_stream.ndata = 0;
@@ -488,7 +486,7 @@ void PluginStream::didReceiveData(WebURLLoader* loader, const char* data, int da
 
     if (m_transferMode != NP_ASFILEONLY) {
         if (!m_deliveryData)
-            m_deliveryData = adoptPtr(new Vector<char>());
+            m_deliveryData = adoptPtr(new std::vector<char>());
 
         int oldSize = m_deliveryData->size();
         m_deliveryData->resize(oldSize + dataLength);

@@ -1,5 +1,5 @@
 ﻿
-#include "node/include/nodeblink.h"
+#include "node/nodeblink.h"
 #include "browser/api/WindowInterface.h"
 #include "browser/api/WindowList.h"
 #include "browser/api/MenuEventNotif.h"
@@ -33,11 +33,15 @@ public:
     }
 
     Menu* getMenu() const {
-        return m_menu;;
+        return m_menu;
     }
 
     void setType(MenuItemType type) {
         m_type = type;
+    }
+
+    MenuItemType getType() const {
+        return m_type;
     }
 
     Menu* getSubMenu() const {
@@ -80,6 +84,8 @@ public:
 
     void insertPlatformMenu(size_t pos, HMENU hMenu) const;
 
+    void clear();
+
 private:
     MenuItemType m_type;
     HMENU m_hSubMenu;
@@ -101,7 +107,7 @@ public:
     explicit Menu(v8::Isolate* isolate, v8::Local<v8::Object> wrapper)
         : m_hideWndHelp(nullptr) {
         gin::Wrappable<Menu>::InitWith(isolate, wrapper);
-        m_menuTemplate = nullptr;
+        //m_menuTemplate = nullptr;
         m_hMenu = NULL;
         m_isItemNeedRebuilt = false;
         m_isAppOrPopupMenu = kNoInit;
@@ -127,6 +133,7 @@ public:
         builder.SetMethod("_insert", &Menu::_insertApi);
         builder.SetMethod("_append", &Menu::_appendeApi);
         builder.SetMethod("_popup", &Menu::_popupApi);
+        builder.SetMethod("_clear", &Menu::_clearApi);
         builder.SetMethod("getItemCount", &Menu::getItemCountApi);
         builder.SetMethod("quit", &Menu::nullFunction);
 
@@ -268,16 +275,38 @@ public:
         ::TrackPopupMenu(m_hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hideWndHelp->getWnd(), NULL);
     }
 
+    void _clearApi() {
+        clear();
+    }
+    void clear() {
+        if (m_hMenu)
+            ::DestroyMenu(m_hMenu);
+        m_hMenu = nullptr;
+        for (size_t i = 0; i < m_items.size(); ++i) {
+            MenuItem* it = m_items[i];
+            it->clear();
+            delete it;
+        }
+        m_items.clear();
+    }
+
     void onCommon(MenuItem* item, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-        if (item->getChecked()) {
-            MENUITEMINFOW info = { 0 };
-            int index = findItemIndex(item) - 1;
-            ::GetMenuItemInfo(m_hMenu, (UINT)item, false, &info);
+        MENUITEMINFOW info = { 0 };
+        info.cbSize = sizeof(MENUITEMINFOW);
+        info.fMask = MIIM_STATE;     // information to get 
+        int index = findItemIndex(item);
+        BOOL b = ::GetMenuItemInfo(m_hMenu, (UINT)index, TRUE, &info);
 
-            info.fState = MFS_UNCHECKED;
-            ::SetMenuItemInfo(m_hMenu, (UINT)item, TRUE, &info);
-
-            item->setChecked(false);
+        if (MenuItem::CheckableActionType == item->getType()) {
+            if (item->getChecked()) {
+                info.fState = MFS_UNCHECKED;
+                b = ::SetMenuItemInfo(m_hMenu, (UINT)index, TRUE, &info);
+                item->setChecked(false);
+            } else {
+                info.fState |= MFS_CHECKED;
+                b = ::SetMenuItemInfo(m_hMenu, (UINT)index, TRUE, &info);
+                item->setChecked(true);
+            }
         }
 
         v8::Local<v8::Value> focusedWindow = WindowInterface::getFocusedWindow(isolate());
@@ -303,7 +332,7 @@ public:
             return m_hMenu;
         m_isItemNeedRebuilt = false;
 
-        AppOrPopupType appOrPopupMenuType = isAppOrPopupMenu ? kIsApp : kIsPopup;;
+        AppOrPopupType appOrPopupMenuType = isAppOrPopupMenu ? kIsApp : kIsPopup;
         if (kNoInit == m_isAppOrPopupMenu)
             m_isAppOrPopupMenu = appOrPopupMenuType;
         else if (m_isAppOrPopupMenu != appOrPopupMenuType)
@@ -354,7 +383,7 @@ private:
         return 0;
     }
 
-    base::ListValue* m_menuTemplate;
+    //base::ListValue* m_menuTemplate;
     HMENU m_hMenu;
     std::vector<MenuItem*> m_items;
     bool m_isItemNeedRebuilt;
@@ -430,6 +459,15 @@ void MenuItem::insertPlatformMenu(size_t pos, HMENU hMenu) const {
     if (CheckableActionType == m_type)
         info.fState |= m_isChecked ? MFS_CHECKED : MFS_UNCHECKED;
     ::InsertMenuItem(hMenu, count, TRUE, &info);
+}
+
+void MenuItem::clear() {
+    if (m_hSubMenu)
+        ::DestroyMenu(m_hSubMenu);
+    m_hSubMenu = nullptr;
+    if (m_subMenu)
+        m_subMenu->clear();
+    m_subMenu = nullptr;
 }
 
 void MenuEventNotif::onWindowDidCreated(WindowInterface* window) {

@@ -23,18 +23,23 @@
 #include "third_party/WebKit/public/platform/WebGestureCurveTarget.h"
 #include "third_party/WebKit/public/platform/Platform.h"
 #include "third_party/WebKit/public/platform/WebThread.h"
+#include "third_party/WebKit/Source/platform/WebThreadSupportingGC.h"
 #include "third_party/WebKit/Source/platform/graphics/GraphicsContext.h" // TODO
 #include "third_party/WebKit/Source/platform/geometry/win/IntRectWin.h"
 #include "wke/wkeWebView.h"
 
 extern DWORD g_nowTime;
-extern double g_kDrawMinInterval;
 
 using namespace blink;
 
 namespace cc {
 
 LayerTreeHost* gLayerTreeHost = nullptr;
+
+static void initializeCompositeThread(blink::WebThreadSupportingGC* webThreadSupportingGC)
+{
+    webThreadSupportingGC->initialize();
+}
 
 LayerTreeHost::LayerTreeHost(LayerTreeHostClent* hostClient, LayerTreeHostUiThreadClient* uiThreadClient)
 {
@@ -62,6 +67,7 @@ LayerTreeHost::LayerTreeHost(LayerTreeHostClent* hostClient, LayerTreeHostUiThre
     
     m_memoryCanvas = nullptr;
     m_paintToMemoryCanvasInUiThreadTaskCount = 0;
+    m_drawMinInterval = 0.003;
 
     m_isDrawDirty = true;
     m_lastCompositeTime = 0.0;
@@ -74,10 +80,17 @@ LayerTreeHost::LayerTreeHost(LayerTreeHostClent* hostClient, LayerTreeHostUiThre
     m_postpaintMessageCount = 0;
     m_hasResize = false;
     m_compositeThread = nullptr;
-    if (m_uiThreadClient)
-        m_compositeThread = blink::Platform::current()->createThread("CompositeThread");
-
+    if (m_uiThreadClient) {
+        m_compositeThread = blink::WebThreadSupportingGC::create("CompositeThread");
+        m_compositeThread->platformThread().postTask(FROM_HERE, WTF::bind(&initializeCompositeThread, m_compositeThread.get()));
+    }
     gLayerTreeHost = this;
+}
+
+static void shutdownCompositeThread(blink::WebThreadSupportingGC* webThread, int* waitCount)
+{
+    webThread->shutdown();
+    atomicDecrement(waitCount);
 }
 
 LayerTreeHost::~LayerTreeHost()
@@ -98,9 +111,15 @@ LayerTreeHost::~LayerTreeHost()
     waitForApplyActions();
 
     ASSERT(0 == m_actionsFrameGroup->getFramesSize());
-
-    if (m_compositeThread)
-        delete m_compositeThread;
+    if (m_compositeThread) {
+        int waitCount = 1;
+        blink::WebThreadSupportingGC* webThread = m_compositeThread.leakPtr();
+        webThread->platformThread().postTask(FROM_HERE, WTF::bind(&shutdownCompositeThread, webThread, &waitCount));
+        while (waitCount) {
+            ::Sleep(100);
+        }
+        delete webThread;
+    }
 
     if (m_memoryCanvas)
         delete m_memoryCanvas;
@@ -146,7 +165,7 @@ LayerTreeHost::~LayerTreeHost()
     m_actionsFrameGroup = nullptr;
 }
 
-void LayerTreeHost::waitForApplyActions()
+void LayerTreeHost::waitForDrawFrame()
 {
     int finishCount = 0;
     do {
@@ -155,7 +174,13 @@ void LayerTreeHost::waitForApplyActions()
         m_compositeMutex.unlock();
         Sleep(20);
     } while (0 != finishCount);
+}
 
+void LayerTreeHost::waitForApplyActions()
+{
+    waitForDrawFrame();
+
+    int finishCount = 0;
     do {
         m_compositeMutex.lock();
         finishCount = m_requestApplyActionsFinishCount;
@@ -163,7 +188,6 @@ void LayerTreeHost::waitForApplyActions()
         Sleep(20);
     } while (0 != finishCount);
 }
-
 
 bool LayerTreeHost::isDestroying() const
 {
@@ -334,7 +358,7 @@ bool LayerTreeHost::canRecordActions() const
     
     double lastRecordTime = WTF::monotonicallyIncreasingTime();
     double detTime = lastRecordTime - m_lastRecordTime;
-    if (detTime < g_kDrawMinInterval)
+    if (detTime < m_drawMinInterval)
         return false;
     m_lastRecordTime = lastRecordTime;
 
@@ -527,13 +551,10 @@ void printTrans(const SkMatrix44& transform, int deep)
     OutputDebugStringW(outString.charactersWithNullTermination().data());
 }
 
-void LayerTreeHost::drawToCanvas(SkCanvas* canvas, const SkRect& dirtyRect)
+bool LayerTreeHost::drawToCanvas(SkCanvas* canvas, const SkRect& dirtyRect)
 {
-    if (!getRootCCLayer())
-        return;
-
     if (dirtyRect.isEmpty())
-        return;
+        return false;
 
     canvas->save();
     canvas->clipRect(dirtyRect);
@@ -544,10 +565,15 @@ void LayerTreeHost::drawToCanvas(SkCanvas* canvas, const SkRect& dirtyRect)
     // http://blog.csdn.net/to_be_designer/article/details/48530921
     clearColorPaint.setXfermodeMode(SkXfermode::kSrcOver_Mode); // SkXfermode::kSrcOver_Mode
     canvas->drawRect((SkRect)dirtyRect, clearColorPaint);
-    
-    m_rootCCLayer->drawToCanvasChildren(this, canvas, dirtyRect, 0);
+
+    bool b = false;
+    WTF::Locker<WTF::Mutex> locker(m_rootCCLayerMutex);
+    if (getRootCCLayer())
+        b = m_rootCCLayer->drawToCanvasChildren(this, canvas, dirtyRect, 1, 0);
 
     canvas->restore();
+
+    return b;
 }
 
 struct DrawPropertiesFromAncestor {
@@ -741,6 +767,7 @@ void LayerTreeHost::setRootLayer(const blink::WebLayer& layer)
 
 CompositingLayer* LayerTreeHost::getRootCCLayer()
 {
+    WTF::Locker<WTF::Mutex> locker(m_rootCCLayerMutex);
     if (m_rootCCLayer)
         return m_rootCCLayer;
     if (!m_rootLayer)
@@ -755,9 +782,12 @@ void LayerTreeHost::clearRootLayer()
     m_rootLayer = nullptr;
 
     while (0 != RasterTaskWorkerThreadPool::shared()->getPendingRasterTaskNum()) { ::Sleep(20); }
-        requestApplyActionsToRunIntoCompositeThread(false);
 
+    requestApplyActionsToRunIntoCompositeThread(false);
+
+    m_rootCCLayerMutex.lock();
     m_rootCCLayer = nullptr;
+    m_rootCCLayerMutex.unlock();
 }
 
 void LayerTreeHost::setViewportSize(const blink::WebSize& deviceViewportSize)
@@ -878,7 +908,7 @@ void LayerTreeHost::requestDrawFrameToRunIntoCompositeThread()
 
     atomicIncrement(&m_drawFrameCount);
     atomicIncrement(&m_drawFrameFinishCount);
-    m_compositeThread->postTask(FROM_HERE, WTF::bind(&LayerTreeHost::drawFrameInCompositeThread, this));
+    m_compositeThread->platformThread().postTask(FROM_HERE, WTF::bind(&LayerTreeHost::drawFrameInCompositeThread, this));
 }
 
 void LayerTreeHost::requestApplyActionsToRunIntoCompositeThread(bool needCheck)
@@ -893,7 +923,7 @@ void LayerTreeHost::requestApplyActionsToRunIntoCompositeThread(bool needCheck)
 
     atomicIncrement(&m_requestApplyActionsCount);
     atomicIncrement(&m_requestApplyActionsFinishCount);
-    m_compositeThread->postTask(FROM_HERE, WTF::bind(&LayerTreeHost::onApplyActionsInCompositeThread, this, needCheck));
+    m_compositeThread->platformThread().postTask(FROM_HERE, WTF::bind(&LayerTreeHost::onApplyActionsInCompositeThread, this, needCheck));
 }
 
 void LayerTreeHost::onApplyActionsInCompositeThread(bool needCheck)
@@ -918,6 +948,11 @@ void LayerTreeHost::clearCanvas(SkCanvas* canvas, const SkRect& rect, bool useLa
     SkRect skrc;
     skrc.set(rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height());
     canvas->drawRect(skrc, clearPaint);
+}
+
+void LayerTreeHost::setDrawMinInterval(double drawMinInterval)
+{
+    m_drawMinInterval = drawMinInterval;
 }
 
 void LayerTreeHost::postPaintMessage(const SkRect& paintRect)
@@ -964,8 +999,10 @@ void LayerTreeHost::firePaintEvent(HDC hdc, const RECT* paintRect)
 
     if (!m_hasTransparentBackground)
         skia::DrawToNativeContext(m_memoryCanvas, hdc, paintRect->left, paintRect->top, paintRect);
-    else
-        skia::DrawToNativeLayeredContext(m_memoryCanvas, hdc, paintRect, &intRectToWinRect(m_clientRect));
+    else {
+        RECT rc = blink::intRectToWinRect(m_clientRect);
+        skia::DrawToNativeLayeredContext(m_memoryCanvas, hdc, paintRect, &rc);
+    }
 }
 
 void LayerTreeHost::drawFrameInCompositeThread()
@@ -978,7 +1015,7 @@ void LayerTreeHost::drawFrameInCompositeThread()
 
     double lastCompositeTime = WTF::monotonicallyIncreasingTime();
     double detTime = lastCompositeTime - m_lastCompositeTime;
-    if (detTime < g_kDrawMinInterval && !m_isDestroying) { // 如果刷新频率太快，缓缓再画
+    if (detTime < m_drawMinInterval && !m_isDestroying) { // 如果刷新频率太快，缓缓再画
         requestDrawFrameToRunIntoCompositeThread();
         atomicDecrement(&m_drawFrameFinishCount);
         return;
@@ -1009,7 +1046,7 @@ void LayerTreeHost::drawFrameInCompositeThread()
 
     for (size_t i = 0; i < dirtyRects.size() && !m_isDestroying; ++i) {
         const SkRect& r = dirtyRects[i];
-        paintToMemoryCanvas(r);
+        paintToMemoryCanvasInCompositeThread(r);
     }
 
     postDrawFrame();
@@ -1054,7 +1091,7 @@ void LayerTreeHost::WrapSelfForUiThread::paintInUiThread()
 
     double lastPaintTime = WTF::monotonicallyIncreasingTime();
     double detTime = lastPaintTime - m_host->m_lastPaintTime;
-    if (detTime < g_kDrawMinInterval) {
+    if (detTime < m_host->m_drawMinInterval) {
         m_host->requestPaintToMemoryCanvasToUiThread(IntRect());
         endPaint();
         return;
@@ -1073,6 +1110,23 @@ void LayerTreeHost::WrapSelfForUiThread::paintInUiThread()
     endPaint();
 }
 
+LayerTreeHost::WrapSelfForUiThread::~WrapSelfForUiThread()
+{
+    
+}
+
+void LayerTreeHost::WrapSelfForUiThread::willProcessTask()
+{
+    Platform::current()->mainThread()->removeTaskObserver(this);
+    paintInUiThread();
+}
+
+void LayerTreeHost::WrapSelfForUiThread::didProcessTask()
+{
+    Platform::current()->mainThread()->removeTaskObserver(this);
+    paintInUiThread();
+}
+
 void LayerTreeHost::requestPaintToMemoryCanvasToUiThread(const SkRect& r)
 {
     WTF::Locker<WTF::Mutex> locker(m_compositeMutex);
@@ -1085,22 +1139,18 @@ void LayerTreeHost::requestPaintToMemoryCanvasToUiThread(const SkRect& r)
     if (!dirtyRect.intersect(clientRect))
         return;
 
-//     m_dirtyRectsForUi.append(dirtyRect);
-//     mergeDirty(&m_dirtyRectsForUi);
     addAndMergeDirty(&m_dirtyRectsForUi, dirtyRect);
 
-    if (m_paintToMemoryCanvasInUiThreadTaskCount > 30) {
-        //OutputDebugStringA("LayerTreeHost::requestPaintToMemoryCanvasToUiThread\n");
+    if (m_paintToMemoryCanvasInUiThreadTaskCount > 30)
         return;
-    }
 
     WrapSelfForUiThread* wrap = new WrapSelfForUiThread(this);
     m_wrapSelfForUiThreads.add(wrap);
     atomicIncrement(&m_paintToMemoryCanvasInUiThreadTaskCount);
-    Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&LayerTreeHost::WrapSelfForUiThread::paintInUiThread, wrap));
+    Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&LayerTreeHost::WrapSelfForUiThread::paintInUiThread, wrap)); //addTaskObserver(wrap);
 }
 
-void LayerTreeHost::paintToMemoryCanvas(const SkRect& r)
+void LayerTreeHost::paintToMemoryCanvasInCompositeThread(const SkRect& r)
 {
     WTF::Locker<WTF::Mutex> locker(m_compositeMutex);
     SkRect paintRect = r;
@@ -1128,7 +1178,10 @@ void LayerTreeHost::paintToMemoryCanvas(const SkRect& r)
     if (m_hasTransparentBackground)
         clearCanvas(m_memoryCanvas, paintRect, m_hasTransparentBackground);
 
-    drawToCanvas(m_memoryCanvas, paintRect); // 绘制脏矩形
+    bool needNotifUi = drawToCanvas(m_memoryCanvas, paintRect); // 绘制脏矩形
+
+    if (!needNotifUi)
+        return;
 
 #if ENABLE_WKE == 1
     if (blink::RuntimeEnabledFeatures::updataInOtherThreadEnabled()) {

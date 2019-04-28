@@ -434,15 +434,19 @@ static bool shouldTrimFromURL(unsigned char c)
     return c <= ' ';
 }
 
-void KURL::init(const KURL& base, const String& relative, const TextEncoding& encoding)
+void KURL::init(const KURL& baseURL , const String& relative, const TextEncoding& encoding)
 {
     // Allow resolutions with a null or empty base URL, but not with any other invalid one.
     // FIXME: Is this a good rule?
-    if (!base.m_isValid && !base.isEmpty()) {
+    if (!baseURL.m_isValid && !baseURL.isEmpty()) {
         m_string = relative;
         invalidate();
         return;
     }
+
+    KURL base(baseURL);
+    if (baseURL.isNull())
+        base = KURL(ParsedURLString, "");
 
     // For compatibility with Win IE, treat backslashes as if they were slashes,
     // as long as we're not dealing with javascript: or data: URLs.
@@ -1264,7 +1268,8 @@ void KURL::parse(const String& string)
     CharBuffer buffer(utf8.size() + 1);
     copyASCII((const LChar*)utf8.data(), utf8.size(), buffer.data());
     buffer[utf8.size()] = '\0';
-    parse(buffer.data(), &String(utf8.data(), utf8.size()));
+    String temp(utf8.data(), utf8.size());
+    parse(buffer.data(), &temp);
 }
 
 static inline bool equal(const char* a, size_t lenA, const char* b, size_t lenB)

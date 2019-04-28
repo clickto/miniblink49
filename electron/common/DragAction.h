@@ -2,7 +2,11 @@
 #ifndef common_DragAction_h
 #define common_DragAction_h
 
+#include "content/ui/WebDropSource.h"
+#include "content/ui/WCDataObject.h"
+
 #include "base/COMPtr.h"
+#include "base/strings/string_util.h"
 #include <shobjidl.h>
 #include <shlguid.h>
 #include <ShellAPI.h>
@@ -31,27 +35,32 @@ public:
         return &textFormat;
     }
 
-    static wkeString getPlainText(IDataObject* dataObject) {
+    static wkeMemBuf* getPlainText(IDataObject* dataObject) {
         STGMEDIUM store;
-        wkeString text;
+
+        wkeMemBuf* text = nullptr;
         if (SUCCEEDED(dataObject->GetData(getPlainTextWFormatType(), &store))) {
             // Unicode text
             wchar_t* data = static_cast<wchar_t*>(::GlobalLock(store.hGlobal));
-            text = wkeCreateStringW(data, wcslen(data));
+            //text = wkeCreateStringW(data, wcslen(data));
+            std::string dataUtf8 = base::WideToUTF8(base::string16(data));
+            text = wkeCreateMemBuf(nullptr, (void*)dataUtf8.c_str(), dataUtf8.size());
+
             GlobalUnlock(store.hGlobal);
             ReleaseStgMedium(&store);
         } else if (SUCCEEDED(dataObject->GetData(getPlainTextFormatType(), &store))) {
             // ASCII text
             char* data = static_cast<char*>(GlobalLock(store.hGlobal));
-            text = wkeCreateStringW(L"", 0);
-            wkeSetString(text, data, strlen(data));
+//             text = wkeCreateStringW(L"", 0);
+//             wkeSetString(text, data, strlen(data));
+            text = wkeCreateMemBuf(nullptr, (void*)data, strlen(data));
             ::GlobalUnlock(store.hGlobal);
             ReleaseStgMedium(&store);
         } else {
             // FIXME: Originally, we called getURL() here because dragging and dropping files doesn't
             // populate the drag with text data. Per https://bugs.webkit.org/show_bug.cgi?id=38826, this
             // is undesirable, so maybe this line can be removed.
-            text = wkeCreateStringW(L"", 0); // getURL(dataObject, nullptr);
+            text = nullptr; // wkeCreateStringW(L"", 0); // getURL(dataObject, nullptr);
         }
         return text;
     }
@@ -68,11 +77,13 @@ public:
 
     static FORMATETC* cfHDropFormat() {
         static FORMATETC urlFormat = { CF_HDROP, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+
         return &urlFormat;
     }
 
     static bool containsFiles(IDataObject* pDataObject) {
         if (pDataObject) {
+
             HRESULT hr = pDataObject->QueryGetData(cfHDropFormat());
             return hr == S_OK;
         }
@@ -81,6 +92,7 @@ public:
 
     static DWORD dragOperationToDragCursor(wkeWebDragOperation op) {
         DWORD res = DROPEFFECT_NONE;
+
         if (op & wkeWebDragOperationCopy)
             res = DROPEFFECT_COPY;
         else if (op & wkeWebDragOperationLink)
@@ -92,6 +104,7 @@ public:
         return res;
     }
 
+
     static void initWkeWebDragDataItem(wkeWebDragData::Item* item) {
         item->storageType = wkeWebDragData::Item::StorageTypeString;
         item->stringType = nullptr; // wkeCreateStringW(L"", 0);
@@ -99,7 +112,6 @@ public:
         item->filenameData = nullptr; // wkeCreateStringW(L"", 0);
         item->displayNameData = nullptr; // wkeCreateStringW(L"", 0);
         item->binaryData = nullptr;
-        item->binaryDataLength = 0;
         item->title = nullptr; // wkeCreateStringW(L"", 0);
         item->fileSystemURL = nullptr; // wkeCreateStringW(L"", 0);
         item->fileSystemFileSize = 0;
@@ -107,19 +119,90 @@ public:
     }
 
     static void releaseWkeWebDragData(wkeWebDragData* data) {
-        wkeDeleteString(data->m_filesystemId);
+        wkeFreeMemBuf(data->m_filesystemId);
         for (int i = 0; i < data->m_itemListLength; ++i) {
             wkeWebDragData::Item* item = &data->m_itemList[i];
-            wkeDeleteString(item->stringType);
-            wkeDeleteString(item->stringData);
-            wkeDeleteString(item->filenameData) ;
-            wkeDeleteString(item->displayNameData);
-            if (item->binaryData)
-                free(item->binaryData);
-            wkeDeleteString(item->title);
-            wkeDeleteString(item->fileSystemURL);
-            wkeDeleteString(item->baseURL);
+            wkeFreeMemBuf(item->stringType);
+            wkeFreeMemBuf(item->stringData);
+            wkeFreeMemBuf(item->filenameData);
+            wkeFreeMemBuf(item->displayNameData);
+            wkeFreeMemBuf(item->binaryData);
+            wkeFreeMemBuf(item->title);
+            wkeFreeMemBuf(item->fileSystemURL);
+            wkeFreeMemBuf(item->baseURL);
         }
+    }
+
+    void onStartDragging(
+        wkeWebView webView,
+        void* param,
+        wkeWebFrameHandle frame,
+        const wkeWebDragData* wkeDragData,
+        wkeWebDragOperationsMask mask,
+        const void* image,
+        const wkePoint* dragImageOffset
+        ) {
+        HRESULT hr = E_NOTIMPL;
+        DWORD okEffect = draggingSourceOperationMaskToDragCursors(mask);
+        DWORD effect = DROPEFFECT_NONE;
+
+        //We liberally protect everything, to protect against a load occurring mid-drag
+        COMPtr<IDragSourceHelper> helper;
+        COMPtr<IDropSource> source;
+        if ((content::WebDropSource::createInstance(&source)) < 0)
+            return;
+
+        content::WCDataObject* dataObjectPtr = nullptr;
+        content::WCDataObject::createInstance(&dataObjectPtr);
+
+        if (wkeDragData) {
+            wkeWebDragData::Item* items = wkeDragData->m_itemList;
+            for (int i = 0; i < wkeDragData->m_itemListLength; ++i) {
+                wkeWebDragData::Item* it = &items[i];
+                if (wkeWebDragData::Item::StorageTypeString == it->storageType) {
+                    std::string type = " ";
+                    if (it->stringType && it->stringType->data && it->stringType->length != 0)
+                        type = std::string((const char*)it->stringType->data, it->stringType->length);
+
+                    std::string data = " ";
+                    if (it->stringData && it->stringData->data && it->stringData->length != 0)
+                        data = std::string((const char*)it->stringData->data, it->stringData->length);
+
+                    dataObjectPtr->writeString(type, data);
+                }
+            }
+        }
+
+        m_dragData = dataObjectPtr;
+        hr = ::DoDragDrop(m_dragData.get(), source.get(), okEffect, &effect);
+
+        POINT* screenPoint = new POINT();
+        ::GetCursorPos(screenPoint);
+
+        POINT* clientPoint = new POINT(); 
+        *clientPoint = *screenPoint;
+        ::ScreenToClient(m_viewWindow, clientPoint);
+
+        wkeWebDragOperation operation = wkeWebDragOperationNone;
+        if (hr == DRAGDROP_S_DROP) {
+            if (effect & DROPEFFECT_COPY)
+                operation = wkeWebDragOperationCopy;
+            else if (effect & DROPEFFECT_LINK)
+                operation = wkeWebDragOperationLink;
+            else if (effect & DROPEFFECT_MOVE)
+                operation = wkeWebDragOperationMove;
+        }
+
+        int id = m_id;
+        wkeWebView webview = m_webview;
+        ThreadCall::callBlinkThreadSync([id, webview, screenPoint, clientPoint, operation] {
+            if (IdLiveDetect::get()->isLive(id))
+                wkeDragTargetEnd(webview, clientPoint, screenPoint, operation);
+            
+            delete screenPoint;
+            delete clientPoint;
+        });
+        hr = S_OK;
     }
 
     static wkeWebDragData* dropDataToWebDragData(IDataObject* pDataObject) {
@@ -149,7 +232,9 @@ public:
                 ::DragQueryFile(hDrop, i, &(fileName.at(0)), pathlength);
 
                 result->m_itemList[i].storageType = wkeWebDragData::Item::StorageTypeFileSystemFile;
-                result->m_itemList[i].fileSystemURL = wkeCreateStringW(&fileName.at(0), pathlength);
+
+                std::string fileSystemURL = base::WideToUTF8(base::string16(&fileName.at(0), pathlength));
+                result->m_itemList[i].fileSystemURL = wkeCreateMemBuf(nullptr, (void*)fileSystemURL.c_str(), fileSystemURL.size());
                 result->m_itemListLength++;
             }
 
@@ -158,7 +243,7 @@ public:
             result->m_itemList = new wkeWebDragData::Item();
             initWkeWebDragDataItem(result->m_itemList);
             result->m_itemList->storageType = wkeWebDragData::Item::StorageTypeString;
-            result->m_itemList->stringType = wkeCreateStringW(L"text/plain", wcslen(L"text/plain"));
+            result->m_itemList->stringType = wkeCreateMemBuf(nullptr, "text/plain", strlen("text/plain"));
             result->m_itemList->stringData = getPlainText(pDataObject);
             result->m_itemListLength = 1;
         }
@@ -167,6 +252,7 @@ public:
     }
 
     static DWORD draggingSourceOperationMaskToDragCursors(wkeWebDragOperationsMask op) {
+
         DWORD result = DROPEFFECT_NONE;
         if (op == wkeWebDragOperationEvery)
             return DROPEFFECT_COPY | DROPEFFECT_LINK | DROPEFFECT_MOVE;
@@ -197,7 +283,7 @@ public:
 
         return operation;
     }
-    
+
     // IDropTarget impl
     HRESULT __stdcall DragEnter(IDataObject* pDataObject, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) {
         if (!m_webview)
@@ -212,6 +298,7 @@ public:
             m_dropTargetHelper->DragEnter(m_viewWindow, pDataObject, (POINT*)&pt, *pdwEffect);
 
         POINT* screenPoint = new POINT();
+
         ::GetCursorPos(screenPoint);
 
         POINT* clientPoint = new POINT();
@@ -224,6 +311,7 @@ public:
         wkeWebDragData* data = dropDataToWebDragData(pDataObject);
         ThreadCall::callBlinkThreadAsync([data, id, webview, screenPoint, clientPoint, grfKeyState] {
             if (IdLiveDetect::get()->isLive(id)) {
+
                 wkeWebDragOperation op = wkeDragTargetDragEnter(webview, data,
                     clientPoint, screenPoint,
                     keyStateToDragOperation(grfKeyState), keyStateToDragOperation(grfKeyState));
@@ -233,7 +321,8 @@ public:
             delete clientPoint;
         });
 
-        *pdwEffect = DROPEFFECT_MOVE; // dragOperationToDragCursor(op);
+        *pdwEffect = DROPEFFECT_MOVE;
+        //dragOperationToDragCursor(op);
 
         m_lastDropEffect = *pdwEffect;
         m_dragData = pDataObject;
@@ -250,6 +339,7 @@ public:
 
         if (m_dragData) {
             POINT* screenPoint = new POINT();
+
             ::GetCursorPos(screenPoint);
 
             POINT* clientPoint = new POINT();
@@ -268,7 +358,8 @@ public:
                 delete clientPoint;
             });
 
-            *pdwEffect = DROPEFFECT_MOVE; // dragOperationToDragCursor(op);
+            *pdwEffect = DROPEFFECT_MOVE; 
+            //dragOperationToDragCursor(op);
         } else
             *pdwEffect = DROPEFFECT_NONE;
 
@@ -305,6 +396,7 @@ public:
         *pdwEffect = m_lastDropEffect;
 
         POINT* screenPoint = new POINT();
+
         ::GetCursorPos(screenPoint);
 
         POINT* clientPoint = new POINT();
@@ -316,7 +408,7 @@ public:
         ThreadCall::callBlinkThreadAsync([id, webview, screenPoint, clientPoint, grfKeyState] {
             if (IdLiveDetect::get()->isLive(id) && webview)
                 wkeDragTargetDrop(webview, clientPoint, screenPoint, keyStateToDragOperation(grfKeyState));
-            
+
             delete screenPoint;
             delete clientPoint;
         });

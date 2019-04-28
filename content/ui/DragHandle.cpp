@@ -1,14 +1,18 @@
-
+﻿
 #include "content/ui/DragHandle.h"
 #include "content/ui/WCDataObject.h"
 #include "content/ui/WebDropSource.h"
 #include "content/ui/ClipboardUtil.h"
+#include "content/browser/CheckReEnter.h"
+#include "wke/wkedefine.h"
+#include "wke/wkeGlobalVar.h"
 #include "third_party/WebKit/public/web/WebLocalFrame.h"
 #include "third_party/WebKit/Source/web/WebViewImpl.h"
 #include "third_party/WebKit/public/platform/WebImage.h"
 #include "third_party/WebKit/public/platform/WebPoint.h"
-
-extern bool g_isSetDragDropEnable;
+#include "third_party/WebKit/public/platform/Platform.h"
+#include "base/values.h"
+#include "base/json/json_writer.h"
 
 namespace content {
 
@@ -22,6 +26,7 @@ DragHandle::DragHandle(
     , m_notifOnDragging(std::move(notifOnDragging))
 {
     m_refCount = 0;
+    m_taskCount = 0;
     m_viewWindow = nullptr;
     m_webViewImpl = nullptr;
 }
@@ -85,10 +90,32 @@ blink::WebDragData DragHandle::dropDataToWebDragData(IDataObject* pDataObject)
         blink::WebDragData::Item item;
         item.storageType = blink::WebDragData::Item::StorageTypeString;
         item.stringType = blink::WebString::fromUTF8(kMimeTypeText);
-        item.stringData = ClipboardUtil::getPlainText(pDataObject);
+        item.stringData = blink::WebString::fromUTF8(ClipboardUtil::getPlainText(pDataObject));
         itemList.push_back(item);
     }
 
+    base::DictionaryValue* dictVal = ClipboardUtil::getCustomPlainTexts(pDataObject);
+    if (dictVal) {
+        base::DictionaryValue::Iterator it(*dictVal);
+        for (; !it.IsAtEnd(); it.Advance()) {
+            std::string type = it.key();
+            std::string text;
+
+            const base::Value& val = it.value();
+            if (!val.IsType(base::Value::TYPE_STRING))
+                continue;
+            if (!val.GetAsString(&text) || text.empty())
+                continue;
+
+            blink::WebDragData::Item item;
+            item.storageType = blink::WebDragData::Item::StorageTypeString;
+            item.stringType = blink::WebString::fromUTF8(type.c_str());
+            item.stringData = blink::WebString::fromUTF8(text.c_str());
+            itemList.push_back(item);
+        }
+        delete dictVal;
+    }
+        
     result.setItems(itemList);
     //result.setFilesystemId(drop_data.filesystem_id);
 
@@ -97,28 +124,215 @@ blink::WebDragData DragHandle::dropDataToWebDragData(IDataObject* pDataObject)
 
 DWORD DragHandle::dragOperationToDragCursor(blink::WebDragOperation op)
 {
-    DWORD res = DROPEFFECT_NONE;
+    DWORD result = DROPEFFECT_NONE;
     if (op & blink::WebDragOperationCopy)
-        res = DROPEFFECT_COPY;
+        result = DROPEFFECT_COPY;
     else if (op & blink::WebDragOperationLink)
-        res = DROPEFFECT_LINK;
+        result = DROPEFFECT_LINK;
     else if (op & blink::WebDragOperationMove)
-        res = DROPEFFECT_MOVE;
+        result = DROPEFFECT_MOVE;
     else if (op & blink::WebDragOperationGeneric)
-        res = DROPEFFECT_MOVE; //This appears to be the Firefox behaviour
-    return res;
+        result = DROPEFFECT_MOVE; //This appears to be the Firefox behaviour
+    return result;
 }
 
+blink::WebDragOperation DragHandle::dragCursorTodragOperation(DWORD op)
+{
+    blink::WebDragOperation result = blink::WebDragOperationNone;
+    if (op & DROPEFFECT_COPY)
+        result = blink::WebDragOperationCopy;
+    else if (op & DROPEFFECT_LINK)
+        result = blink::WebDragOperationLink;
+    else if (op & DROPEFFECT_MOVE)
+        result = blink::WebDragOperationMove;
+    else if (op & DROPEFFECT_MOVE)
+        result = blink::WebDragOperationGeneric;
+    return result;
+}
+
+blink::WebDragOperation DragHandle::startDraggingInUiThread(blink::WebLocalFrame* frame,
+    const wkeWebDragData* data,
+    const blink::WebDragOperationsMask mask,
+    const blink::WebImage* image,
+    const blink::WebPoint* dragImageOffset)
+{
+    //blink::WebDragOperation op = doStartDragging(frame, *data, mask, *image, *dragImageOffset);
+
+    blink::WebDragOperation operation = blink::WebDragOperationNone;
+
+    if (!m_viewWindow && !wke::g_wkeUiThreadPostTaskCallback) // updataInOtherThreadEnabled下这个值为空，除非设置了ui post回调
+        return operation;
+
+    //FIXME: Allow UIDelegate to override behaviour <rdar://problem/5015953>
+
+    //We liberally protect everything, to protect against a load occurring mid-drag
+    COMPtr<IDragSourceHelper> helper;
+    COMPtr<IDropSource> source;
+    if (FAILED(WebDropSource::createInstance(&source)))
+        return operation;
+
+    WCDataObject* dataObjectPtr = nullptr;
+    WCDataObject::createInstance(&dataObjectPtr);
+
+    wkeWebDragData::Item* items = data->m_itemList;
+
+    base::DictionaryValue* dictVal = nullptr;
+
+    for (int i = 0; i < data->m_itemListLength; ++i) {
+        const wkeWebDragData::Item& it = items[i];
+        if (wkeWebDragData::Item::StorageTypeString == it.storageType) {
+            std::string typeStr((const char*)(it.stringType->data ? it.stringType->data : ""), it.stringType->length != 0 ? it.stringType->length : 0);
+            std::string dataStr((const char*)(it.stringData->data ? it.stringData->data : ""), it.stringData->length != 0 ? it.stringData->length : 0);
+            
+            WCDataObject::ClipboardDataType typeEnum = WCDataObject::clipboardTypeFromMIMEType(typeStr);
+            if (WCDataObject::kClipboardDataTypeNone == typeEnum) {
+                if (!dictVal)
+                    dictVal = new base::DictionaryValue();
+
+                dictVal->SetString(typeStr, dataStr);
+            } else
+                dataObjectPtr->writeString(typeStr, dataStr);
+        }
+    }
+
+    if (dictVal) {
+        std::string json;
+        base::JSONWriter::Write(*dictVal, &json);
+        if (json.size() > 0)
+            dataObjectPtr->writeCustomPlainText(json);
+
+        delete dictVal;
+    }
+
+    m_dragData = dataObjectPtr;
+    m_mask = mask;
+
+    if (!wke::g_isSetDragDropEnable) {
+        simulateDrag();
+        return blink::WebDragOperationCopy;
+    }
+
+    if (source && (!image->isNull() || m_dragData)) {
+        if (!image->isNull()) {
+            // if (SUCCEEDED(::CoCreateInstance(CLSID_DragDropHelper, 0, CLSCTX_INPROC_SERVER,
+            //     IID_IDragSourceHelper, (LPVOID*)&helper))) {
+            //     BITMAP b;
+            //     GetObject(image, sizeof(BITMAP), &b);
+            //     SHDRAGIMAGE sdi;
+            //     sdi.sizeDragImage.cx = b.bmWidth;
+            //     sdi.sizeDragImage.cy = b.bmHeight;
+            //     sdi.crColorKey = 0xffffffff;
+            //     sdi.hbmpDragImage = image;
+            //     sdi.ptOffset.x = dragImageOffset.x - imageOrigin.x();
+            //     sdi.ptOffset.y = dragImageOffset.y - imageOrigin.y();
+            //     if (isLink)
+            //         sdi.ptOffset.y = b.bmHeight - sdi.ptOffset.y;
+            // 
+            //     helper->InitializeFromBitmap(&sdi, m_dragData.get());
+            // }
+        }
+
+        DWORD okEffect = draggingSourceOperationMaskToDragCursors(mask);
+        DWORD effect = DROPEFFECT_NONE;
+        HRESULT hr = E_NOTIMPL;
+
+        //         m_notifOnEnterDrag();
+        //         CheckReEnter::decrementEnterCount();
+        hr = ::DoDragDrop(m_dragData.get(), source.get(), okEffect, &effect);
+        //         CheckReEnter::incrementEnterCount();
+        //         m_notifOnLeaveDrag();
+
+        if (hr == DRAGDROP_S_DROP) {
+            if (effect & DROPEFFECT_COPY)
+                operation = blink::WebDragOperationCopy;
+            else if (effect & DROPEFFECT_LINK)
+                operation = blink::WebDragOperationLink;
+            else if (effect & DROPEFFECT_MOVE)
+                operation = blink::WebDragOperationMove;
+        }
+    }
+    return operation;
+}
+
+class StartDraggingTask {
+public:
+    StartDraggingTask(
+        DragHandle* dragHandle,
+        int* count,
+        blink::WebLocalFrame* frame,
+        const wkeWebDragData* data,
+        const blink::WebDragOperationsMask mask,
+        const blink::WebImage& image,
+        const blink::WebPoint& dragImageOffset)
+    {
+        m_dragHandle = dragHandle;
+        m_count = count;
+        m_frame = frame;
+        m_data = data;
+        m_mask = mask;
+        m_image = &image;
+        m_dragImageOffset = &dragImageOffset;
+        m_op = blink::WebDragOperationNone;
+
+        *m_count += 1;
+    }
+
+    static void runInUiThread(HWND hWnd, void* param)
+    {
+        StartDraggingTask* self = (StartDraggingTask*)param;
+        self->runInUiThreadImpl();
+    }
+
+    void runInUiThreadImpl()
+    {
+        m_op = m_dragHandle->startDraggingInUiThread(m_frame, m_data, m_mask, m_image, m_dragImageOffset);
+        *m_count -= 1;
+    }
+
+    blink::WebDragOperation getOp() const { return m_op; }
+
+private:
+    blink::WebLocalFrame* m_frame;
+    const wkeWebDragData* m_data;
+    blink::WebDragOperationsMask m_mask;
+    const blink::WebImage* m_image;
+    const blink::WebPoint* m_dragImageOffset;
+
+    blink::WebDragOperation m_op;
+
+    DragHandle* m_dragHandle;
+    int* m_count;
+};
+
 void DragHandle::startDragging(blink::WebLocalFrame* frame,
-    const blink::WebDragData& data,
+    const wkeWebDragData* dragDate,
     const blink::WebDragOperationsMask mask,
     const blink::WebImage& image,
     const blink::WebPoint& dragImageOffset)
 {
-    if (!m_webViewImpl)
+    if (!m_webViewImpl || !wke::g_isSetDragDropEnable)
         return;
 
-    blink::WebDragOperation op = doStartDragging(frame, data, mask, image, dragImageOffset);
+    m_notifOnEnterDrag();
+    CheckReEnter::decrementEnterCount();
+
+    StartDraggingTask* task = new StartDraggingTask(this, &m_taskCount, frame, dragDate, mask, image, dragImageOffset);
+    if (wke::g_wkeUiThreadPostTaskCallback) {
+        wke::g_wkeUiThreadPostTaskCallback(m_viewWindow, StartDraggingTask::runInUiThread, task);
+
+        MSG msg = { 0 };
+        while (0 != m_taskCount) {
+            if (::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                ::TranslateMessage(&msg);
+                ::DispatchMessageW(&msg);
+            }
+            ::Sleep(10);
+        }
+    } else {
+        StartDraggingTask::runInUiThread(m_viewWindow, (void*)task);
+    }
+    CheckReEnter::incrementEnterCount();
+    m_notifOnLeaveDrag();
 
     POINT screenPoint = { 0 };
     ::GetCursorPos(&screenPoint);
@@ -126,8 +340,10 @@ void DragHandle::startDragging(blink::WebLocalFrame* frame,
     POINT clientPoint = screenPoint;
     ::ScreenToClient(m_viewWindow, &clientPoint);
 
-    m_webViewImpl->dragSourceEndedAt(blink::WebPoint(clientPoint.x, clientPoint.y), blink::WebPoint(screenPoint.x, screenPoint.y), op);
+    m_webViewImpl->dragSourceEndedAt(blink::WebPoint(clientPoint.x, clientPoint.y), blink::WebPoint(screenPoint.x, screenPoint.y), task->getOp());
     m_webViewImpl->dragSourceSystemDragEnded();
+
+    delete task;
 }
 
 void DragHandle::simulateDrag()
@@ -150,82 +366,11 @@ void DragHandle::simulateDrag()
     m_notifOnLeaveDrag();
 }
 
-blink::WebDragOperation DragHandle::doStartDragging(blink::WebLocalFrame* frame,
-    const blink::WebDragData& data,
-    const blink::WebDragOperationsMask mask,
-    const blink::WebImage& image,
-    const blink::WebPoint& dragImageOffset)
+static void dragTargetDragEnter(blink::WebViewImpl* m_webViewImpl, int* taskCount, const blink::WebDragData& data, const blink::WebPoint& clientPoint, const blink::WebPoint& screenPoint, blink::WebDragOperationsMask operationsAllowed)
 {
-    blink::WebDragOperation operation = blink::WebDragOperationNone;
-
-    if (!m_viewWindow) // updataInOtherThreadEnabled�����ֵΪ��
-        return operation;
-
-    //FIXME: Allow UIDelegate to override behaviour <rdar://problem/5015953>
-
-    //We liberally protect everything, to protect against a load occurring mid-drag
-    COMPtr<IDragSourceHelper> helper;
-    COMPtr<IDropSource> source;
-    if (FAILED(WebDropSource::createInstance(&source)))
-        return operation;
-
-    WCDataObject* dataObjectPtr = nullptr;
-    WCDataObject::createInstance(&dataObjectPtr);
-
-    if (!data.isNull()) {
-        blink::WebVector<blink::WebDragData::Item> items = data.items();
-        for (size_t i = 0; i < items.size(); ++i) {
-            blink::WebDragData::Item it = items[i];
-            if (blink::WebDragData::Item::StorageTypeString == it.storageType) {
-                dataObjectPtr->writeString(it.stringType, it.stringData);
-            }
-        }
-    }
-
-    m_dragData = dataObjectPtr;
-    m_mask = mask;
-
-    if (!g_isSetDragDropEnable) {
-        simulateDrag();
-        return blink::WebDragOperationCopy;
-    }
-
-    if (source && (!image.isNull() || m_dragData)) {
-        if (!image.isNull()) {
-            //                 if (SUCCEEDED(::CoCreateInstance(CLSID_DragDropHelper, 0, CLSCTX_INPROC_SERVER,
-            //                     IID_IDragSourceHelper, (LPVOID*)&helper))) {
-            //                     BITMAP b;
-            //                     GetObject(image, sizeof(BITMAP), &b);
-            //                     SHDRAGIMAGE sdi;
-            //                     sdi.sizeDragImage.cx = b.bmWidth;
-            //                     sdi.sizeDragImage.cy = b.bmHeight;
-            //                     sdi.crColorKey = 0xffffffff;
-            //                     sdi.hbmpDragImage = image;
-            //                     sdi.ptOffset.x = dragImageOffset.x - imageOrigin.x();
-            //                     sdi.ptOffset.y = dragImageOffset.y - imageOrigin.y();
-            //                     if (isLink)
-            //                         sdi.ptOffset.y = b.bmHeight - sdi.ptOffset.y;
-            // 
-            //                     helper->InitializeFromBitmap(&sdi, m_dragData.get());
-            //                 }
-        }
-
-        DWORD okEffect = draggingSourceOperationMaskToDragCursors(mask);
-        DWORD effect = DROPEFFECT_NONE;
-        HRESULT hr = E_NOTIMPL;
-
-        hr = ::DoDragDrop(m_dragData.get(), source.get(), okEffect, &effect);
-
-        if (hr == DRAGDROP_S_DROP) {
-            if (effect & DROPEFFECT_COPY)
-                operation = blink::WebDragOperationCopy;
-            else if (effect & DROPEFFECT_LINK)
-                operation = blink::WebDragOperationLink;
-            else if (effect & DROPEFFECT_MOVE)
-                operation = blink::WebDragOperationMove;
-        }
-    }
-    return operation;
+    int modifiers = (int)operationsAllowed;
+    m_webViewImpl->dragTargetDragEnter(data, clientPoint, screenPoint, operationsAllowed, modifiers);
+    *taskCount -= 1;
 }
 
 // IDropTarget impl
@@ -246,17 +391,34 @@ HRESULT __stdcall DragHandle::DragEnter(IDataObject* pDataObject, DWORD grfKeySt
     POINT clientPoint = screenPoint;
     ::ScreenToClient(m_viewWindow, &clientPoint);
 
-    blink::WebDragOperation op = m_webViewImpl->dragTargetDragEnter(dropDataToWebDragData(pDataObject),
-        blink::WebPoint(clientPoint.x, clientPoint.y),
-        blink::WebPoint(screenPoint.x, screenPoint.y),
-        keyStateToDragOperation(grfKeyState), keyStateToDragOperation(grfKeyState));
+    if (WTF::isMainThread()) {
+        blink::WebDragOperation op = m_webViewImpl->dragTargetDragEnter(dropDataToWebDragData(pDataObject),
+            blink::WebPoint(clientPoint.x, clientPoint.y),
+            blink::WebPoint(screenPoint.x, screenPoint.y),
+            keyStateToDragOperation(grfKeyState), keyStateToDragOperation(grfKeyState));
 
-    *pdwEffect = dragOperationToDragCursor(op);
+        *pdwEffect = dragOperationToDragCursor(op);
+    } else {
+        m_taskCount++;
+        blink::Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&dragTargetDragEnter, m_webViewImpl, &m_taskCount
+             , dropDataToWebDragData(pDataObject)
+             , blink::WebPoint(clientPoint.x, clientPoint.y)
+             , blink::WebPoint(screenPoint.x, screenPoint.y)
+             , keyStateToDragOperation(grfKeyState)
+            ));
+        *pdwEffect = DROPEFFECT_MOVE;
+    }
 
     m_lastDropEffect = *pdwEffect;
-    ASSERT(m_dragData.get() == pDataObject);
+    //ASSERT(m_dragData.get() == pDataObject); // 外部拖入会触发这个断言
 
     return S_OK;
+}
+
+static void dragTargetDragOver(blink::WebViewImpl* m_webViewImpl, int* taskCount, const blink::WebPoint& clientPoint, const blink::WebPoint& screenPoint, blink::WebDragOperationsMask operationsAllowed, int modifiers)
+{
+    m_webViewImpl->dragTargetDragOver(clientPoint, screenPoint, operationsAllowed, modifiers);
+    *taskCount -= 1;
 }
 
 HRESULT __stdcall DragHandle::DragOver(DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)
@@ -273,17 +435,33 @@ HRESULT __stdcall DragHandle::DragOver(DWORD grfKeyState, POINTL pt, DWORD* pdwE
     POINT clientPoint = screenPoint;
     ::ScreenToClient(m_viewWindow, &clientPoint);
 
-    blink::WebDragOperation op = m_webViewImpl->dragTargetDragOver(
-        blink::WebPoint(clientPoint.x, clientPoint.y),
-        blink::WebPoint(screenPoint.x, screenPoint.y),
-        m_mask, keyStateToDragOperation(grfKeyState));
+    blink::WebDragOperation op = blink::WebDragOperationNone;
+    if (WTF::isMainThread()) {
+        op = m_webViewImpl->dragTargetDragOver(
+            blink::WebPoint(clientPoint.x, clientPoint.y),
+            blink::WebPoint(screenPoint.x, screenPoint.y),
+            m_mask, keyStateToDragOperation(grfKeyState));
 
-    *pdwEffect = DROPEFFECT_NONE;
-    if (m_dragData)
-        *pdwEffect = dragOperationToDragCursor(op);       
-
+        *pdwEffect = DROPEFFECT_NONE;
+        if (m_dragData)
+            *pdwEffect = dragOperationToDragCursor(op);
+    } else {
+        m_taskCount++;
+        blink::Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&dragTargetDragOver, m_webViewImpl, &m_taskCount,
+            blink::WebPoint(clientPoint.x, clientPoint.y),
+            blink::WebPoint(screenPoint.x, screenPoint.y),
+            m_mask, keyStateToDragOperation(grfKeyState)
+            ));
+        *pdwEffect = DROPEFFECT_MOVE;
+    }
     m_lastDropEffect = *pdwEffect;
     return S_OK;
+}
+
+static void dragTargetDragLeave(blink::WebViewImpl* webViewImpl, int* taskCount)
+{
+    webViewImpl->dragTargetDragLeave();
+    *taskCount -= 1;
 }
 
 HRESULT __stdcall DragHandle::DragLeave() 
@@ -292,11 +470,23 @@ HRESULT __stdcall DragHandle::DragLeave()
         m_dropTargetHelper->DragLeave();
 
     if (m_dragData) {
-        if (m_webViewImpl)
-            m_webViewImpl->dragTargetDragLeave();
+        if (m_webViewImpl) {
+            if (WTF::isMainThread()) {
+                m_webViewImpl->dragTargetDragLeave();
+            } else {
+                m_taskCount++;
+                blink::Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&dragTargetDragLeave, m_webViewImpl, &m_taskCount));
+            }
+        }
         m_dragData = nullptr;
     }
     return S_OK;
+}
+
+static void dragTargetDrop(blink::WebViewImpl* webViewImpl, int* taskCount, const blink::WebPoint& clientPoint, const blink::WebPoint& screenPoint, int modifiers)
+{
+    webViewImpl->dragTargetDrop(clientPoint, screenPoint, modifiers);
+    *taskCount -= 1;
 }
 
 HRESULT __stdcall DragHandle::Drop(IDataObject* pDataObject, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)
@@ -316,8 +506,15 @@ HRESULT __stdcall DragHandle::Drop(IDataObject* pDataObject, DWORD grfKeyState, 
     POINT clientPoint = screenPoint;
     ::ScreenToClient(m_viewWindow, &clientPoint);
 
-    m_webViewImpl->dragTargetDrop(blink::WebPoint(clientPoint.x, clientPoint.y),
-        blink::WebPoint(screenPoint.x, screenPoint.y), keyStateToDragOperation(grfKeyState));
+    if (WTF::isMainThread()) {
+        m_webViewImpl->dragTargetDrop(blink::WebPoint(clientPoint.x, clientPoint.y),
+            blink::WebPoint(screenPoint.x, screenPoint.y), keyStateToDragOperation(grfKeyState));
+    } else {
+        m_taskCount++;
+        blink::Platform::current()->mainThread()->postTask(FROM_HERE, WTF::bind(&dragTargetDrop, m_webViewImpl, &m_taskCount,
+            blink::WebPoint(clientPoint.x, clientPoint.y),
+            blink::WebPoint(screenPoint.x, screenPoint.y), keyStateToDragOperation(grfKeyState)));
+    }
     
     return S_OK;
 }

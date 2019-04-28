@@ -7,11 +7,10 @@
 #ifndef UI_BASE_CLIPBOARD_CLIPBOARD_UTIL_WIN_H_
 #define UI_BASE_CLIPBOARD_CLIPBOARD_UTIL_WIN_H_
 
-#include "third_party/WebKit/Source/platform/weborigin/KURL.h"
-#include "third_party/WebKit/Source/wtf/text/WTFString.h"
-#include "third_party/WebKit/Source/wtf/text/WTFStringUtil.h"
-
 #include <string>
+#include <vector>
+
+#include <ShlObj.h>
 
 #define kMimeTypeText "text/plain"
 #define kMimeTypeURIList "text/uri-list"
@@ -19,51 +18,45 @@
 #define kMimeTypeHTML "text/html"
 #define kMimeTypeRTF "text/rtf"
 #define kMimeTypePNG "image/png"
+#define kMimeTypeBMP "image/bmp"
 
 struct tagFORMATETC;
 typedef tagFORMATETC FORMATETC;
+
+namespace base {
+class DictionaryValue;
+}
 
 namespace content {
 
 class ClipboardUtil {
 public:
-    static UINT getHtmlFormatType();
-
-    static UINT getWebKitSmartPasteFormatType();
-
-    static UINT getUrlWFormatType();
-
-    static UINT getRtfFormatType();
-
-    static const UINT getWebCustomDataFormatType();
-
+    static unsigned int getHtmlFormatType();
+    static unsigned int getWebKitSmartPasteFormatType();
+    static unsigned int getUrlWFormatType();
+    static unsigned int getRtfFormatType();
+    static const unsigned int getWebCustomDataFormatType();
     static FORMATETC* getPlainTextWFormatType();
-
     static FORMATETC* getPlainTextFormatType();
-
     static FORMATETC* urlWFormat();
-
     static FORMATETC* urlFormat();
+    static FORMATETC* getCustomTextsType();
 
-    static bool getWebLocData(IDataObject* dataObject, String& url, String* title);
+    static bool getWebLocData(IDataObject* dataObject, std::string& url, std::string* title);
 
-    static String extractURL(const String &inURL, String* title);
+    static std::string extractURL(const std::string& inURL, std::string* title);
 
-    static String getURL(IDataObject* dataObject, String* title);
+    static std::string getURL(IDataObject* dataObject, std::string* title);
 
-    static String getPlainText(IDataObject* dataObject);
+    static std::string getPlainText(IDataObject* dataObject);
+    static base::DictionaryValue* getCustomPlainTexts(IDataObject* dataObject);
 
-    static HGLOBAL createGlobalData(const blink::KURL& url, const String& title);
+    static HGLOBAL createGlobalData(const std::string& url, const std::string& title);
+    static HGLOBAL createGlobalData(const std::string& str);
 
-    static HGLOBAL createGlobalData(const Vector<UChar>& str);
+    static std::string htmlToCFHtml(const std::string& html, const std::string& base_url);
 
-    static WTF::String ClipboardUtil::HtmlToCFHtml(const std::string& html, const std::string& base_url);
-
-    static void CFHtmlExtractMetadata(const std::string& cf_html,
-        std::string* base_url,
-        size_t* html_start,
-        size_t* fragment_start,
-        size_t* fragment_end);
+    static void cfHtmlExtractMetadata(const std::string& cfHtml, std::string* baseUrl, size_t* htmlStart, size_t* fragmentStart, size_t* fragmentEnd);
 };
 
 }

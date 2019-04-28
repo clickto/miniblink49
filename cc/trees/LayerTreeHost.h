@@ -2,6 +2,7 @@
 #define LayerTreeHost_h
 
 #include "third_party/WebKit/public/platform/WebLayerTreeView.h"
+#include "third_party/WebKit/public/platform/WebThread.h"
 #include "third_party/WebKit/Source/platform/geometry/IntRect.h"
 #include "third_party/WebKit/Source/platform/geometry/IntSize.h"
 #include "third_party/WebKit/Source/wtf/HashMap.h"
@@ -16,6 +17,7 @@ class WebGestureCurveTarget;
 class IntRect;
 struct WebFloatSize;
 class WebThread;
+class WebThreadSupportingGC;
 }
 
 namespace cc_blink {
@@ -62,7 +64,7 @@ public:
 
     //void updateLayers(SkCanvas* canvas, const blink::IntRect& clip, bool needsFullTreeSync);
     void recordDraw();
-    void drawToCanvas(SkCanvas* canvas, const SkRect& clip);
+    bool drawToCanvas(SkCanvas* canvas, const SkRect& clip);
     void updateLayersDrawProperties();
 
     //void setNeedsCommit();
@@ -173,6 +175,8 @@ public:
     //void setUseLayeredBuffer(bool b);
     //bool getIsUseLayeredBuffer() const { return m_useLayeredBuffer; }
     static void clearCanvas(SkCanvas* canvas, const SkRect& rect, bool useLayeredBuffer);
+
+    void setDrawMinInterval(double drawMinInterval);
     
     void postPaintMessage(const SkRect& paintRect);
     void firePaintEvent(HDC hdc, const RECT* paintRect);
@@ -193,9 +197,10 @@ private:
     void requestPaintToMemoryCanvasToUiThread(const SkRect& r);
     void onApplyActionsInCompositeThread(bool needCheck);
     void waitForApplyActions();
+    void waitForDrawFrame();
     void drawFrameInCompositeThread();
     void paintToMemoryCanvasInUiThread(const SkRect& paintRect);
-    void paintToMemoryCanvas(const SkRect& r);
+    void paintToMemoryCanvasInCompositeThread(const SkRect& r);
     
     bool m_isDestroying;
 
@@ -215,8 +220,6 @@ private:
     float m_pageScaleFactor;
     float m_minimum;
     float m_maximum;
-
-    //bool m_needsFullTreeSync;
     bool m_needTileRender;
     bool m_layerTreeDirty; // ÐèÒªWebPageImpl.recordDraw
 
@@ -238,13 +241,15 @@ private:
     WTF::Vector<LayerChangeAction*> m_actions;
     WTF::HashMap<int, CompositingLayer*> m_liveCCLayers;
     //////////////////////////////////////////////////////////////////////////
-    blink::WebThread* m_compositeThread;
+    WTF::OwnPtr<blink::WebThreadSupportingGC> m_compositeThread;
     WTF::Mutex m_compositeMutex;
+    WTF::Mutex m_rootCCLayerMutex;
     SkCanvas* m_memoryCanvas;
 
     double m_lastCompositeTime;
     double m_lastPaintTime;
     mutable double m_lastRecordTime;
+    double m_drawMinInterval;
 
     static const int m_paintMessageQueueSize = 200;
     Vector<SkRect> m_dirtyRectsForComposite;
@@ -254,14 +259,17 @@ private:
     int m_drawFrameFinishCount;
     int m_requestApplyActionsCount;
     int m_requestApplyActionsFinishCount;
-    //bool m_useLayeredBuffer;
 
-    struct WrapSelfForUiThread {
+    struct WrapSelfForUiThread : public blink::WebThread::TaskObserver {
         WrapSelfForUiThread(LayerTreeHost* host)
             : m_host(host) { }
         LayerTreeHost* m_host;
         void paintInUiThread();
         void endPaint();
+
+        virtual ~WrapSelfForUiThread() override;
+        virtual void willProcessTask() override;
+        virtual void didProcessTask() override;
     };
     friend WrapSelfForUiThread;
     WTF::HashSet<WrapSelfForUiThread*> m_wrapSelfForUiThreads;
